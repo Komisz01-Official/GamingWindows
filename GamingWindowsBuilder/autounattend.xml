@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <!--
+    GamingWindowsBuilder v0.4.19 companion unattend.xml
+
+    Design goals:
+      - Windows 11 Pro
+      - Hungarian UI (primary), English UI (secondary/fallback)
+      - German keyboard (primary), Hungarian keyboard (secondary)
+      - Optional TPM / Secure Boot / RAM setup bypasses retained from the source XML
+      - Two local accounts:
+          Admin = local administrator, NOT used for daily work
+          User  = standard user, intended for daily work ("Gamer" is the display name)
+      - Single-use auto-logon as the daily-driver account so FirstLogonCommands
+        can run before any interactive logon. AutoLogon is disabled after the
+        first logon by LogonCount=1.
+      - NO embedded third-party debloat/customization scripts
+      - NO automatic disk partitioning/wiping
+      - NO Windows Update disabling/pausing
+      - NO UAC/VBS/security-feature changes
+  -->
+
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE"
+              processorArchitecture="amd64"
+              publicKeyToken="31bf3856ad364e35"
+              language="neutral"
+              versionScope="nonSxS">
+      <!-- Installer UI stays in English; the installed OS will use Hungarian
+           because the oobeSystem pass below overrides it. -->
+      <UILanguage>en-US</UILanguage>
+      <SetupUILanguage>
+        <UILanguage>en-US</UILanguage>
+      </SetupUILanguage>
+    </component>
+
+    <component name="Microsoft-Windows-Setup"
+              processorArchitecture="amd64"
+              publicKeyToken="31bf3856ad364e35"
+              language="neutral"
+              versionScope="nonSxS">
+
+      <UserData>
+        <ProductKey>
+          <!-- Generic Windows 11 Pro installation key; this does NOT activate Windows. -->
+          <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+
+      <UseConfigurationSet>false</UseConfigurationSet>
+
+      <!-- Keep the hardware-requirement bypasses from the supplied XML.
+           Remove this RunSynchronous block if the target PC already satisfies
+           Windows 11 requirements and you want normal Setup enforcement. -->
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg.exe add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg.exe add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg.exe add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <!-- Intentionally no specialize scripts, registry hacks, package removal,
+       scheduled tasks, Edge modifications, or OneDrive removal here.
+       Those responsibilities belong to GamingWindowsBuilder. -->
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core"
+              processorArchitecture="amd64"
+              publicKeyToken="31bf3856ad364e35"
+              language="neutral"
+              versionScope="nonSxS">
+
+      <!--
+        Display language: Hungarian primary, English secondary.
+        UILanguageFallback is what Windows falls back to for any resource
+        that has no Hungarian string; without it, some OOBE and shell text
+        can appear in an unexpected language.
+      -->
+      <UILanguage>hu-HU</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+
+      <!--
+        Regional formats: Hungarian.
+        SystemLocale governs non-Unicode (codepage) programs.
+        UserLocale governs date/time/number/currency format for new accounts.
+      -->
+      <SystemLocale>hu-HU</SystemLocale>
+      <UserLocale>hu-HU</UserLocale>
+
+      <!--
+        Input locales: German primary, Hungarian secondary.
+        Format is <languageID>:<keyboardLayoutID>, semicolon-separated.
+        The FIRST pair becomes the default keyboard for the account.
+
+          0407 = German (Germany)
+          040e = Hungarian (Hungary)
+
+          00000407 = German QWERTZ
+          0000040e = Hungarian
+
+        Both layouts are installed. The user can switch between them with
+        Win+Space or by clicking the language indicator in the taskbar.
+      -->
+      <InputLocale>0407:00000407;040e:0000040e</InputLocale>
+
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+              processorArchitecture="amd64"
+              publicKeyToken="31bf3856ad364e35"
+              language="neutral"
+              versionScope="nonSxS">
+
+            <!--
+        Two-account model:
+
+          Admin = local administrator, used for setup/maintenance.
+          User  = standard daily-driver account, created on first boot.
+                  DisplayName = "Gamer"
+                  No password.
+
+        Admin is the only account created during Setup so that the first
+        automatic logon cannot depend on an account that does not yet exist.
+      -->
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>Admin</Name>
+            <DisplayName>Administrator</DisplayName>
+            <Description>Local administrator account for maintenance and initial setup.</Description>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>Administrator</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <!--
+        Single-use auto-logon as Admin.
+
+        Admin performs the first-boot setup, including creation of the
+        passwordless standard User account. AutoLogon is disabled after
+        this one login by LogonCount=1.
+      -->
+      <AutoLogon>
+        <Password>
+          <Value>Administrator</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+        <Username>Admin</Username>
+      </AutoLogon>
+
+      <OOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <HideEULAPage>true</HideEULAPage>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+      </OOBE>
+
+      <!--
+        FirstLogonCommands run during the first automatic Admin session.
+
+        Order 1:
+          Create the standard User account with no password and set its
+          display name to "Gamer".
+
+        Order 2:
+          Remove OneDrive residual payloads.
+      -->
+      <FirstLogonCommands>
+
+        <SynchronousCommand wcm:action="add">
+			<Order>1</Order>
+			<Description>Create passwordless Gamer user account</Description>
+			<CommandLine>cmd /c net user User "" /add /fullname:"Gamer" &amp; net localgroup Users User /add</CommandLine>
+			<RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <SynchronousCommand wcm:action="add">
+			<Order>2</Order>
+			<Description>Remove OneDrive residual payloads</Description>
+			<CommandLine>cmd /c del /f /q "%SystemRoot%\System32\OneDriveSetup.exe" &amp; del /f /q "%SystemRoot%\SysWOW64\OneDriveSetup.exe" &amp; rd /s /q "%ProgramFiles%\Microsoft OneDrive" &amp; rd /s /q "%ProgramFiles(x86)%\Microsoft OneDrive" &amp; exit /b 0</CommandLine>
+			<RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+		
+		<SynchronousCommand wcm:action="add">
+			<Order>3</Order>
+			<Description>Install MAS scheduled task</Description>
+			<CommandLine>powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\Setup\install-task.ps1</CommandLine>
+		</SynchronousCommand>
+		
+      </FirstLogonCommands>
+
+    </component>
+  </settings>
+</unattend>
