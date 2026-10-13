@@ -1578,46 +1578,47 @@ foreach ($staleDir in @($WORK_DIR, $MOUNT_DIR)) {
 New-Item -ItemType Directory -Force -Path (Join-Path $WORK_DIR "sources") -ErrorAction Stop | Out-Null
 New-Item -ItemType Directory -Force -Path $MOUNT_DIR -ErrorAction Stop | Out-Null
 
-# ---- Copy OEM overlay into the build tree ----
+# ---- Copy optional OEM overlay into the build tree ----
 # The OEM folder next to the script mirrors the ISO root. Anything under OEM\
-# ends up under $WORK_DIR\, so sources\$OEM$\$1\Setup\ lands at C:\Setup\ on
-# the installed system. Because this runs after the wipe above, the overlay is
-# copied fresh on every build.
+# ends up under $WORK_DIR\; for example, sources\$OEM$\$1\Setup\ lands at
+# C:\Setup\ on the installed system. The overlay is optional so builds do
+# not depend on any optional first-boot payload.
 $oemOverlaySource = Join-Path $PSScriptRoot 'OEM'
 $oemOverlayDest   = Join-Path $WORK_DIR 'sources'
-if (-not (Test-Path -LiteralPath $oemOverlaySource -PathType Container)) {
-    throw "OEM overlay folder not found next to the script: $oemOverlaySource"
-}
+if (Test-Path -LiteralPath $oemOverlaySource -PathType Container) {
+    $expectedPayload = @(
+        Get-ChildItem -LiteralPath $oemOverlaySource -File -Recurse -Force |
+            ForEach-Object {
+                $_.FullName.Substring($oemOverlaySource.Length).TrimStart([char[]]@(92, 47))
+            }
+    )
 
-$expectedPayload = @(
-    '$OEM$\$1\Setup\install-task.ps1',
-    '$OEM$\$1\Setup\wait-and-run.ps1',
-    '$OEM$\$1\Setup\MAS_AIO.cmd'
-)
-foreach ($rel in $expectedPayload) {
-    $full = Join-Path $oemOverlaySource $rel
-    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
-        throw "Required OEM overlay file is missing: $full"
+    if ($expectedPayload.Count -gt 0) {
+        $oemRoboArgs = @(
+            $oemOverlaySource,
+            $oemOverlayDest,
+            '/E', '/COPY:DAT', '/R:3', '/W:5', '/NP'
+        )
+        $oemRobo = Start-Process -FilePath 'robocopy.exe' -ArgumentList $oemRoboArgs -Wait -PassThru -NoNewWindow
+        if ($oemRobo.ExitCode -ge 8) {
+            throw "Robocopy failed while copying the OEM overlay (exit code $($oemRobo.ExitCode))."
+        }
+
+        foreach ($rel in $expectedPayload) {
+            $staged = Join-Path $oemOverlayDest $rel
+            if (-not (Test-Path -LiteralPath $staged -PathType Leaf)) {
+                throw "OEM overlay staging verification failed: $staged is missing."
+            }
+        }
+        Write-Ok "OEM overlay copied into the build tree ($($expectedPayload.Count) payload file(s) verified)."
+    }
+    else {
+        Write-Ok "OEM overlay folder contains no files; skipping optional overlay."
     }
 }
-
-$oemRoboArgs = @(
-    $oemOverlaySource,
-    $oemOverlayDest,
-    '/E', '/COPY:DAT', '/R:3', '/W:5', '/NP'
-)
-$oemRobo = Start-Process -FilePath 'robocopy.exe' -ArgumentList $oemRoboArgs -Wait -PassThru -NoNewWindow
-if ($oemRobo.ExitCode -ge 8) {
-    throw "Robocopy failed while copying the OEM overlay (exit code $($oemRobo.ExitCode))."
+else {
+    Write-Ok "No OEM overlay folder found; skipping optional overlay."
 }
-
-foreach ($rel in $expectedPayload) {
-    $staged = Join-Path $oemOverlayDest $rel
-    if (-not (Test-Path -LiteralPath $staged -PathType Leaf)) {
-        throw "OEM overlay staging verification failed: $staged is missing."
-    }
-}
-Write-Ok "OEM overlay copied into the build tree ($($expectedPayload.Count) payload file(s) verified)."
 
 $mainProgress.CompleteStep()
 
@@ -3120,9 +3121,6 @@ $index = $null
 		$etfsBootPath,
 		$efisysBinPath,
 		(Join-Path $WORK_DIR 'autounattend.xml'),
-        (Join-Path $WORK_DIR 'sources\$OEM$\$1\Setup\install-task.ps1'),
-        (Join-Path $WORK_DIR 'sources\$OEM$\$1\Setup\wait-and-run.ps1'),
-        (Join-Path $WORK_DIR 'sources\$OEM$\$1\Setup\MAS_AIO.cmd')
 	)
 	foreach ($requiredFile in $requiredTreeFiles) {
 		if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
