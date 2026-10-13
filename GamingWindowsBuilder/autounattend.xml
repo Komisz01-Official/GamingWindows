@@ -201,13 +201,7 @@
 			<RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 		
-		<SynchronousCommand wcm:action="add">
-			<Order>3</Order>
-			<Description>Install MAS scheduled task</Description>
-			<CommandLine>powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\Setup\install-task.ps1</CommandLine>
-		</SynchronousCommand>
-		
-      </FirstLogonCommands>
+		</FirstLogonCommands>
 
     </component>
   </settings>
