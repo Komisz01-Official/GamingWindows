@@ -1,14 +1,10 @@
-# GamingWindowsBuilder_v0.4.19.ps1
 #Requires -Version 5.1
-# Version: 0.4.19
 # Rewritten transactionally: build failures are terminating, cleanup is unconditional, and native DISM/registry operations are checked.
-# v0.4.18: All native invocations are routed through Invoke-NativeCommand so that
+# All native invocations are routed through Invoke-NativeCommand so that
 # stderr output from oscdimg/dism/reg/robocopy cannot become a terminating
 # RemoteException while $ErrorActionPreference = 'Stop'.
-# v0.4.19: ISO validation no longer depends on Mount-DiskImage succeeding.
 # Source-tree validation is primary; mount-based validation is best-effort with
 # retry/polling. Invoke-NativeCommand unwraps ErrorRecord instances so OSCDIMG/
-# DISM progress lines appear as readable strings in the log.
 [CmdletBinding()]
 param (
     [ValidatePattern('^[a-zA-Z](?::)?(?:\\.*)?$')]
@@ -23,7 +19,7 @@ param (
     # Override the regex used to auto-detect the Pro edition (useful for non-English media)
     [string]$ProImageRegex = '^Windows 11 Pro$',
 
-    # [FIX v0.4.5] Standard install.wim export supports Maximum/Fast/None.
+    # Standard install.wim export supports Maximum/Fast/None.
     # Recovery compression is for ESD/recovery-style destinations and is not a
     # valid choice for the normal install.wim produced by this builder.
     [ValidateSet('Maximum','Fast','None')]
@@ -42,8 +38,8 @@ param (
 # ==================== CENTRALIZED VERSION CONTROL ====================
 $script:VersionInfo = @{
     Major      = 0
-    Minor      = 4
-    Patch      = 19
+    Minor      = 0
+    Patch      = 1
     Build      = (Get-Date -Format 'yyyyMMdd')
     Codename   = "IsoValidation"
     ScriptName = "GamingWindowsBuilder"
@@ -51,7 +47,7 @@ $script:VersionInfo = @{
     Author     = "GamingWindows Project"
 
     Features = @{
-        # [FIX] DISM is NOT safe to run concurrently against the same offline image.
+        # DISM is NOT safe to run concurrently against the same offline image.
         # Package removal is now always sequential. Multithreading is reserved for
         # future safe workloads (e.g., parallel file copies / ISO assembly).
         UseMultiThreading      = $false
@@ -59,11 +55,11 @@ $script:VersionInfo = @{
         EnableTranscript       = $true
         EnablePreflightChecks  = $true
         HardenedErrorHandling  = $true
-        # [v0.4.18] Route every native invocation through Invoke-NativeCommand
+        # Route every native invocation through Invoke-NativeCommand
         # so that stderr from oscdimg/dism/reg/robocopy cannot become a
         # terminating RemoteException while $ErrorActionPreference = 'Stop'.
         NativeCommandHardening = $true
-        # [v0.4.19] ISO validation does not depend on Mount-DiskImage. The
+        # ISO validation does not depend on Mount-DiskImage. The
         # source tree is the primary validation surface; mount-based checks
         # are best-effort with retry/polling and cannot fail the build.
         ResilientIsoValidation = $true
@@ -84,10 +80,10 @@ $script:VersionInfo.WindowTitle = "{0} v{1} ({2})" -f `
 # ==================== ADMIN GROUP SID (Language-Independent) ====================
 $script:AdminSIDString = "*S-1-5-32-544"
 
-# [FIX v0.4.3 / v0.4.8] Track exit code so the caller sees a proper status.
+# Track exit code so the caller sees a proper status.
 $script:ExitCode = 0
 
-# [FIX v0.4.3] Cache whether progress rendering should occur.
+# Cache whether progress rendering should occur.
 $script:ShowProgress = $script:VersionInfo.Features.EnableProgressTracking -and -not $QuietMode
 
 # ==================== PROGRESS TRACKING CLASS ====================
@@ -131,7 +127,7 @@ class ProgressTracker {
     }
 
     [void]UpdateProgress() {
-        # [FIX v0.4.3] Skip Write-Progress in quiet mode.
+        # Skip Write-Progress in quiet mode.
         if (-not $this.ShowProgress) { return }
 
         $percentComplete = [math]::Min(100, ($this.CurrentStep / $this.TotalSteps) * 100)
@@ -154,7 +150,7 @@ class ProgressTracker {
     }
 
     [void]Complete() {
-        # [FIX v0.4.6] Quiet mode suppresses the progress summary too.
+        # Quiet mode suppresses the progress summary too.
         if ($this.ShowProgress) {
             Write-Progress -Activity $this.Activity -Completed
             $totalTime = (Get-Date) - $this.StartTime
@@ -208,7 +204,7 @@ function Set-CleanupFailure {
 }
 
 function Write-ProgressSafe {
-    # [FIX v0.4.3] Thin wrapper that respects quiet mode.
+    # Thin wrapper that respects quiet mode.
     param(
         [string]$Activity,
         [string]$Status,
@@ -321,7 +317,7 @@ function Invoke-TakeOwnership {
     $takeownResult = Invoke-NativeCommand -FilePath 'takeown.exe' -Arguments $takeownArgs
     $takeownOk = ($takeownResult.ExitCode -eq 0)
 
-    # [FIX v0.4.3] Use /grant:r (replace) so we don't accumulate duplicate ACEs
+    # Use /grant:r (replace) so we don't accumulate duplicate ACEs
     # if ownership is retaken multiple times. Also (OI)(CI) for dirs when recursing
     # so newly-created children inherit the grant.
     $grantArg = if ($Recurse) { "${script:AdminSIDString}:(OI)(CI)(F)" } else { "${script:AdminSIDString}:(F)" }
@@ -1224,7 +1220,7 @@ function Select-WindowsImageIndex {
 
     if ($QuietMode) {
         Write-ErrorMessage "QuietMode requires -ImageIndex when '$ProRegex' cannot be auto-detected."
-        # [FIX v0.4.3] Return $null; callers should test with $null -eq.
+        # Return $null; callers should test with $null -eq.
         return $null
     }
 
@@ -1347,7 +1343,7 @@ if (-not $myWindowsPrincipal.IsInRole($adminRole)) {
     if ($PSBoundParameters.ContainsKey('ProImageRegex')) {
         $argList += @('-ProImageRegex', $ProImageRegex)
     }
-    # [FIX v0.4.3] Forward -ExportCompression when the caller explicitly set it.
+    # Forward -ExportCompression when the caller explicitly set it.
     if ($PSBoundParameters.ContainsKey('ExportCompression')) {
         $argList += @('-ExportCompression', $ExportCompression)
     }
@@ -1547,7 +1543,7 @@ if ($SourceDrive) {
     } while ($true)
 }
 
-# [PATCH] Source and scratch must be different drives. Using the same drive can
+# Source and scratch must be different drives. Using the same drive can
 # cause recursive copying / exhaustion of free space and can corrupt the build.
 if ($DriveLetter.TrimEnd(':\').ToUpperInvariant() -eq $ScratchDisk.TrimEnd(':\').ToUpperInvariant()) {
     throw "SourceDrive and ScratchDisk must be different drives. SourceDrive=$DriveLetter, ScratchDisk=$ScratchDisk"
@@ -1564,7 +1560,7 @@ $mainProgress.CompleteStep()
 # ==================== CREATE DIRECTORY STRUCTURE ====================
 $mainProgress.StartStep("Creating directory structure")
 
-# P0: DISM mount registration survives ordinary directory deletion. Recover all
+# DISM mount registration survives ordinary directory deletion. Recover all
 # build-related stale mounts before touching the work tree or mount directory.
 Invoke-StaleBuildMountRecovery -MountPath $MOUNT_DIR -WimPath $WIM_PATH -Attempts 3
 
@@ -1861,7 +1857,7 @@ $index = $null
         })
 
         if ($packagesToRemove.Count -gt 0) {
-            # [CRITICAL FIX] DISM operations against the SAME offline image MUST be
+            # DISM operations against the SAME offline image MUST be
             # sequential. Running them in parallel corrupts the image or returns
             # ERROR_BUSY (0x800700AA).
             $removedCount = 0
@@ -1946,8 +1942,8 @@ $index = $null
         }
 
         # Edge Update scheduled tasks are normally stored at the root of System32\Tasks
-        # (e.g. MicrosoftEdgeUpdateTaskMachineCore / ...UA), not under the path used by
-        # the old v0.4.12 block. Remove the task files by name and clean all TaskCache links.
+        # (e.g. MicrosoftEdgeUpdateTaskMachineCore / ...UA).
+        # Remove the task files by name and clean all TaskCache links.
         $taskFilesRoot = Join-Path $MOUNT_DIR 'Windows\System32\Tasks'
         if (Test-Path -LiteralPath $taskFilesRoot) {
             $edgeTasks = @(Get-ChildItem -LiteralPath $taskFilesRoot -Recurse -File -Force -ErrorAction Stop | Where-Object {
@@ -3327,7 +3323,7 @@ finally {
     }
 
     # ---- Recover any remaining build-related DISM mounts. ------------------
-    # P0: actual DISM state is authoritative; boolean flags alone are not.
+    # Actual DISM state is authoritative; boolean flags alone are not.
     $mountStateKnown = $false
     $activeBuildMounts = @()
     try {
@@ -3437,5 +3433,5 @@ finally {
     }
 }
 
-# [FIX v0.4.3] Exit with the accumulated code so schedulers/CI see the real status.
+# Exit with the accumulated code so schedulers/CI see the real status.
 exit $script:ExitCode
