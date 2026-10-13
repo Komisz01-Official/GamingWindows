@@ -3120,7 +3120,7 @@ $index = $null
 		$BOOT_WIM_PATH,
 		$etfsBootPath,
 		$efisysBinPath,
-		(Join-Path $WORK_DIR 'autounattend.xml'),
+		(Join-Path $WORK_DIR 'autounattend.xml')
 	)
 	foreach ($requiredFile in $requiredTreeFiles) {
 		if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
