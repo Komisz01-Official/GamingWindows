@@ -173,6 +173,7 @@
         <HideEULAPage>true</HideEULAPage>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+		<HidePrivacySettings>true</HidePrivacySettings>
       </OOBE>
 
       <!--
