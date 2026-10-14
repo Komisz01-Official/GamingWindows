@@ -39,30 +39,22 @@ param (
 $script:VersionInfo = @{
     Major      = 0
     Minor      = 1
-    Patch      = 1
+    Patch      = 2
     Build      = (Get-Date -Format 'yyyyMMdd')
-    Codename   = "IsoValidation"
+    Codename   = "RobustHiveUnload"
     ScriptName = "GamingWindowsBuilder"
     OutputName = "GamingWindows"
     Author     = "GamingWindows Project"
 
     Features = @{
-        # DISM is NOT safe to run concurrently against the same offline image.
-        # Package removal is now always sequential. Multithreading is reserved for
-        # future safe workloads (e.g., parallel file copies / ISO assembly).
         UseMultiThreading      = $false
         EnableProgressTracking = $true
         EnableTranscript       = $true
         EnablePreflightChecks  = $true
         HardenedErrorHandling  = $true
-        # Route every native invocation through Invoke-NativeCommand
-        # so that stderr from oscdimg/dism/reg/robocopy cannot become a
-        # terminating RemoteException while $ErrorActionPreference = 'Stop'.
         NativeCommandHardening = $true
-        # ISO validation does not depend on Mount-DiskImage. The
-        # source tree is the primary validation surface; mount-based checks
-        # are best-effort with retry/polling and cannot fail the build.
         ResilientIsoValidation = $true
+        RobustHiveUnload       = $true
     }
 }
 
@@ -80,11 +72,29 @@ $script:VersionInfo.WindowTitle = "{0} v{1} ({2})" -f `
 # ==================== ADMIN GROUP SID (Language-Independent) ====================
 $script:AdminSIDString = "*S-1-5-32-544"
 
-# Track exit code so the caller sees a proper status.
 $script:ExitCode = 0
 
-# Cache whether progress rendering should occur.
 $script:ShowProgress = $script:VersionInfo.Features.EnableProgressTracking -and -not $QuietMode
+
+# ==================== NATIVE P/INVOKE FOR REGISTRY UNLOAD ====================
+# RegUnLoadKey bypasses reg.exe and often succeeds when reg.exe is blocked by
+# a stale provider handle. Add-Type is idempotent enough for our purposes.
+if (-not ('Win32.AdvApi32' -as [type])) {
+    try {
+        Add-Type -Namespace Win32 -Name AdvApi32 -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("advapi32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode, SetLastError=true)]
+public static extern int RegUnLoadKey(System.IntPtr hKey, string lpSubKey);
+
+[System.Runtime.InteropServices.DllImport("advapi32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode, SetLastError=true)]
+public static extern int RegOpenKeyEx(System.IntPtr hKey, string lpSubKey, uint ulOptions, int samDesired, out System.IntPtr phkResult);
+
+[System.Runtime.InteropServices.DllImport("advapi32.dll", SetLastError=true)]
+public static extern int RegCloseKey(System.IntPtr hKey);
+"@ -ErrorAction SilentlyContinue
+    } catch {
+        # Not fatal: reg.exe fallback still works.
+    }
+}
 
 # ==================== PROGRESS TRACKING CLASS ====================
 class ProgressTracker {
@@ -127,14 +137,11 @@ class ProgressTracker {
     }
 
     [void]UpdateProgress() {
-        # Skip Write-Progress in quiet mode.
         if (-not $this.ShowProgress) { return }
 
         $percentComplete = [math]::Min(100, ($this.CurrentStep / $this.TotalSteps) * 100)
         $elapsed = (Get-Date) - $this.StartTime
         if ($this.CurrentStep -gt 0) {
-            # Estimate from completed elapsed work rather than treating the current
-            # step as already completed. This avoids systematically inflated ETAs.
             $avgStepTime = $elapsed.TotalSeconds / $this.CurrentStep
             $remaining    = [math]::Max(0, $this.TotalSteps - $this.CurrentStep)
             $etaSeconds   = $avgStepTime * $remaining
@@ -150,7 +157,6 @@ class ProgressTracker {
     }
 
     [void]Complete() {
-        # Quiet mode suppresses the progress summary too.
         if ($this.ShowProgress) {
             Write-Progress -Activity $this.Activity -Completed
             $totalTime = (Get-Date) - $this.StartTime
@@ -185,7 +191,6 @@ function Write-Ok {
 }
 function Write-WarningMsg {
     param([string]$Text)
-    # Warnings are shown even in QuietMode (they matter).
     Write-Output "  [!] $Text"
 }
 function Write-ErrorMessage {
@@ -194,7 +199,6 @@ function Write-ErrorMessage {
 }
 
 function Set-CleanupFailure {
-    <# Mark cleanup as failed so the process cannot report a false success. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'None')]
     param([Parameter(Mandatory)][string]$Message)
     if ($PSCmdlet.ShouldProcess("cleanup state", "Mark cleanup as failed")) {
@@ -204,7 +208,6 @@ function Set-CleanupFailure {
 }
 
 function Write-ProgressSafe {
-    # Thin wrapper that respects quiet mode.
     param(
         [string]$Activity,
         [string]$Status,
@@ -220,41 +223,6 @@ function Write-ProgressSafe {
 }
 
 function Invoke-NativeCommand {
-    <#
-    .SYNOPSIS
-        Invokes a native executable and captures combined stdout/stderr without
-        allowing stderr to become a terminating PowerShell error when
-        $ErrorActionPreference = 'Stop'.
-
-    .DESCRIPTION
-        PowerShell converts stderr output from a native executable into a
-        System.Management.Automation.ErrorRecord (wrapping a
-        System.Management.Automation.RemoteException) when the pipeline is
-        being collected under $ErrorActionPreference = 'Stop'. Tools such as
-        oscdimg, dism, reg, and robocopy routinely write informational text to
-        stderr (banners, progress, "Operation completed successfully"), so a
-        naive `& tool.exe ... 2>&1` will abort the script even on success.
-
-        This helper temporarily relaxes ErrorActionPreference around the native
-        call, captures the merged stream, unwraps any ErrorRecord instances to
-        their inner message strings (so log output is human-readable rather
-        than littered with "System.Management.Automation.RemoteException"),
-        restores the caller's preference, and returns a structured result.
-        Callers decide success based on ExitCode and inspect Output for
-        diagnostics.
-
-    .PARAMETER FilePath
-        The executable to invoke. May be a name on PATH or a full path.
-
-    .PARAMETER Arguments
-        Argument array. Each argument is passed as a separate token; PowerShell
-        handles any required quoting.
-
-    .OUTPUTS
-        PSCustomObject with:
-            ExitCode : [int]      The native process exit code.
-            Output   : [string[]] Combined stdout+stderr lines, unwrapped.
-    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$FilePath,
@@ -264,16 +232,10 @@ function Invoke-NativeCommand {
     $previousEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        # NativeCommandUseErrorActionPreference (PS 7.3+) is not assumed; the
-        # explicit EAP relaxation above is what actually suppresses the
-        # terminating-ErrorRecord behavior on 5.1 and 7.x alike.
         $output = @(
             & $FilePath @Arguments 2>&1 |
                 ForEach-Object {
                     if ($_ -is [System.Management.Automation.ErrorRecord]) {
-                        # A native stderr line wrapped by PowerShell. Emit the
-                        # original message text so the build log stays readable
-                        # instead of containing bare "RemoteException" markers.
                         [string]$_.Exception.Message
                     }
                     else {
@@ -296,12 +258,6 @@ function Invoke-NativeCommand {
 }
 
 function Invoke-TakeOwnership {
-    <#
-    .SYNOPSIS
-        Takes ownership of a file or directory using SID (language-independent).
-    .OUTPUTS
-        Boolean - $true if successful, $false otherwise.
-    #>
     param(
         [Parameter(Mandatory)][string]$Path,
         [switch]$Recurse
@@ -311,15 +267,11 @@ function Invoke-TakeOwnership {
     $takeownArgs = @('/F', $Path)
     if ($Recurse) {
         $takeownArgs += '/R'
-        # /D accepts Y or N; '*' is not a valid takeown choice.
         $takeownArgs += @('/D', 'Y')
     }
     $takeownResult = Invoke-NativeCommand -FilePath 'takeown.exe' -Arguments $takeownArgs
     $takeownOk = ($takeownResult.ExitCode -eq 0)
 
-    # Use /grant:r (replace) so we don't accumulate duplicate ACEs
-    # if ownership is retaken multiple times. Also (OI)(CI) for dirs when recursing
-    # so newly-created children inherit the grant.
     $grantArg = if ($Recurse) { "${script:AdminSIDString}:(OI)(CI)(F)" } else { "${script:AdminSIDString}:(F)" }
     $icaclsArgs = @($Path, '/grant:r', $grantArg, '/C', '/Q')
     if ($Recurse) { $icaclsArgs += '/T' }
@@ -348,16 +300,9 @@ function Remove-PathSafe {
 }
 
 function Resolve-DriveLetter {
-    <#
-    .SYNOPSIS
-        Extracts a normalized drive letter (e.g., "D:") from a letter or "D:".
-        Callers validate drive-letter-only parameters before this function is invoked.
-    #>
     param([string]$InputValue)
     if ([string]::IsNullOrWhiteSpace($InputValue)) { return $null }
 
-    # Normalize a drive letter supplied as "D", "D:", or a path beginning
-    # with "D:\". The caller ultimately needs only the root drive.
     if ($InputValue -match '^([a-zA-Z])(?::)?(?:\\.*)?$') {
         return "$($matches[1].ToUpperInvariant()):"
     }
@@ -365,17 +310,6 @@ function Resolve-DriveLetter {
 }
 
 function Set-RegistryValue {
-    <#
-    .SYNOPSIS
-        Bulk-sets DWORD values under a registry key using reg.exe.
-    .PARAMETER HivePath
-        Full path, e.g. HKLM\zSOFTWARE\Policies\Microsoft\Windows\DataCollection
-    .PARAMETER Values
-        Hashtable of ValueName = DWORD value.
-    .PARAMETER RequireExistingKey
-        Refuses to create a missing key. Use this for existing system/service keys
-        where creating a partial registry tree could produce an invalid configuration.
-    #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$HivePath,
@@ -404,10 +338,6 @@ function Set-RegistryValue {
 }
 
 function Set-RegistryValuesMap {
-    <#
-    .SYNOPSIS
-        Convenience wrapper over Set-RegistryValue when you have a map of key -> values.
-    #>
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][hashtable]$Map)
     foreach ($key in $Map.Keys) {
@@ -416,11 +346,6 @@ function Set-RegistryValuesMap {
 }
 
 function Test-Confirmation {
-    <#
-    .SYNOPSIS
-        Interactive yes/no prompt; returns $true only if user answers "yes".
-        In QuietMode or with -Force, always returns $true.
-    #>
     param([string]$Prompt)
     if ($QuietMode -or $Force) { return $true }
     $response = Read-Host "$Prompt (yes/no)"
@@ -467,19 +392,6 @@ function Remove-RegistryValueIfExists {
 }
 
 function Remove-OfflineScheduledTaskTree {
-    <#
-    .SYNOPSIS
-        Removes an entire scheduled-task cache subtree from an offline SYSTEM
-        hive. Used for tasks (such as OneDrive) whose registration lives under
-        a dedicated folder in TaskCache\Tree.
-
-    .DESCRIPTION
-        Uses defensive enumeration rather than Test-Path as the existence guard:
-        the PowerShell registry provider can report $true for a key that does
-        not exist under a freshly-loaded hive. If the tree is absent, returns
-        silently. Individual removal failures are reported as warnings rather
-        than terminating the cleanup.
-    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SystemHive,
@@ -488,8 +400,6 @@ function Remove-OfflineScheduledTaskTree {
 
     $providerRoot = "Registry::$SystemHive\$TaskTreePath"
 
-    # Discover task-cache GUIDs to remove. The tree may not exist; that is a
-    # normal condition, not an error.
     $taskIds = [System.Collections.Generic.List[string]]::new()
     try {
         foreach ($key in @(Get-ChildItem -LiteralPath $providerRoot -Recurse -Force -ErrorAction Stop)) {
@@ -523,7 +433,6 @@ function Remove-OfflineScheduledTaskTree {
         }
     }
     catch [System.Management.Automation.ItemNotFoundException] {
-        # The task tree does not exist in this image. Nothing to do.
         Write-Step "Scheduled-task tree '$TaskTreePath' is not present under $SystemHive; nothing to remove."
         return
     }
@@ -545,7 +454,6 @@ function Remove-OfflineScheduledTaskTree {
         "$SystemHive\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Maintenance"
     )
 
-    # Release provider references before the reg.exe deletions.
     $props = $null
     $key = $null
     $rootProps = $null
@@ -576,31 +484,6 @@ function Remove-OfflineScheduledTaskTree {
 }
 
 function Remove-OfflineScheduledTasksByName {
-    <#
-    .SYNOPSIS
-        Removes offline scheduled-task cache registrations whose leaf task name
-        matches any supplied regex. This is used for tasks such as EdgeUpdate
-        that live directly under the Tasks root rather than under a dedicated
-        folder.
-
-    .DESCRIPTION
-        Operates against a mounted offline SYSTEM hive via the PowerShell
-        registry provider. The provider has two behaviours that require care:
-
-          1. Test-Path can return $true for a key that does not exist under a
-             freshly-loaded hive. Existence therefore has to be determined by
-             actually enumerating, not by probing.
-
-          2. Enumerating a key that does not exist throws
-             ItemNotFoundException. That is normal when the TaskCache tree has
-             never been populated in this image, and must not be treated as a
-             build failure.
-
-        Individual key removal failures are reported as warnings rather than
-        terminating the cleanup: a single locked key must not prevent the rest
-        of the batch from completing. Any residual registrations will be
-        re-checked by the caller.
-    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SystemHive,
@@ -609,8 +492,6 @@ function Remove-OfflineScheduledTasksByName {
 
     $treeRoot = "Registry::$SystemHive\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree"
 
-    # Discover candidate task-tree keys defensively. Do not use Test-Path here:
-    # the registry provider can report $true for a key that does not exist.
     $matches = @()
     try {
         $matches = @(
@@ -625,13 +506,10 @@ function Remove-OfflineScheduledTasksByName {
         )
     }
     catch [System.Management.Automation.ItemNotFoundException] {
-        # The TaskCache tree does not exist in this image at all. Nothing to do.
         Write-Step "No TaskCache tree present under $SystemHive; skipping scheduled-task cleanup."
         return
     }
     catch {
-        # Any other enumeration failure is worth surfacing as a warning, but
-        # should not abort the build: the caller will re-verify afterwards.
         Write-WarningMsg "Could not enumerate TaskCache tree '$treeRoot': $($_.Exception.Message)"
         return
     }
@@ -655,9 +533,6 @@ function Remove-OfflineScheduledTasksByName {
     foreach ($taskKey in $matches) {
         $taskId = $null
 
-        # Look up the {GUID} Id for this task registration. If the key has no
-        # Id (malformed, or a container node rather than a leaf), skip the
-        # orphan-index cleanup and just remove the tree key itself.
         try {
             $props = Get-ItemProperty -LiteralPath $taskKey.PSPath -ErrorAction Stop
             if ($props -and $props.PSObject.Properties['Id'] -and
@@ -670,21 +545,13 @@ function Remove-OfflineScheduledTasksByName {
             Write-WarningMsg "Could not inspect scheduled-task registration '$($taskKey.PSPath)': $($_.Exception.Message)"
         }
 
-        # Remove the indexed cache entry under each TaskCache\<category> base.
-        # Use a try/catch rather than Test-Path: the provider's Test-Path is
-        # unreliable for freshly-loaded hives.
         if ($taskId) {
             foreach ($base in $taskCacheBases) {
                 $taskCacheKey = Join-Path $base $taskId
-
-                # Suppress any object output from Remove-Item so nothing leaks
-                # into the caller's output stream.
                 try {
                     $null = Remove-Item -LiteralPath $taskCacheKey -Recurse -Force -ErrorAction Stop
                 }
                 catch [System.Management.Automation.ItemNotFoundException] {
-                    # Not present under this category; that is normal for any
-                    # given task (a task is only indexed under one category).
                 }
                 catch {
                     Write-WarningMsg "Could not remove TaskCache index '$taskCacheKey': $($_.Exception.Message)"
@@ -692,7 +559,6 @@ function Remove-OfflineScheduledTasksByName {
             }
         }
 
-        # Remove the registration itself from the Tree.
         try {
             $null = Remove-Item -LiteralPath $taskKey.PSPath -Recurse -Force -ErrorAction Stop
             $removedCount++
@@ -711,23 +577,128 @@ function Remove-OfflineScheduledTasksByName {
     }
 }
 
+function Invoke-RegistryHiveOperations {
+    <#
+    .SYNOPSIS
+        Sequentially loads or unloads registry hives (NOT thread-safe).
+
+    .DESCRIPTION
+        Unload uses a multi-phase strategy:
+          1. Force GC to release managed provider wrappers before each attempt.
+          2. reg.exe unload with exponential backoff (5 attempts).
+          3. Native RegUnLoadKey P/Invoke fallback that bypasses reg.exe.
+          4. Treats "parameter is incorrect" / "cannot find" as success
+             (hive was already unloaded).
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('Load','Unload')][string]$Operation,
+        [Parameter(Mandatory)][object]$Hives
+    )
+
+    $results = [System.Collections.ArrayList]::new()
+
+    if ($Operation -eq 'Load') {
+        $keys = if ($Hives -is [hashtable] -or $Hives -is [System.Collections.IDictionary]) {
+            @($Hives.Keys)
+        } else {
+            throw "For -Operation Load, -Hives must be a hashtable/dictionary of HiveName = HiveFilePath."
+        }
+
+        foreach ($hiveName in $keys) {
+            $hivePath = $Hives[$hiveName]
+
+            if (Test-Path -LiteralPath $hivePath) {
+                $loadResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @(
+                    'load', $hiveName, $hivePath
+                )
+
+                if ($loadResult.ExitCode -eq 0) {
+                    $results.Add($hiveName) | Out-Null
+                } else {
+                    Write-WarningMsg "Failed to load hive $hiveName from $hivePath (reg.exe exit code $($loadResult.ExitCode)): $($loadResult.Output -join ' ')"
+                }
+            } else {
+                Write-WarningMsg "Hive file not found: $hivePath (skipping $hiveName)"
+            }
+        }
+    } else {
+        foreach ($hiveName in @($Hives)) {
+            if ([string]::IsNullOrWhiteSpace($hiveName)) { continue }
+
+            $unloaded = $false
+            $lastOutput = ''
+
+            # Phase 1: reg.exe unload with GC + exponential backoff.
+            for ($attempt = 1; $attempt -le 5 -and -not $unloaded; $attempt++) {
+                [GC]::Collect()
+                [GC]::WaitForPendingFinalizers()
+                [GC]::Collect()
+
+                if ($attempt -gt 1) {
+                    $delayMs = [math]::Min(4000, 500 * [math]::Pow(2, $attempt - 1))
+                    Start-Sleep -Milliseconds $delayMs
+                }
+
+                $unloadResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @(
+                    'unload', $hiveName
+                )
+
+                $lastOutput = ($unloadResult.Output -join ' ').Trim()
+
+                if ($unloadResult.ExitCode -eq 0) {
+                    $results.Add($hiveName) | Out-Null
+                    $unloaded = $true
+                }
+                elseif ($lastOutput -match 'The parameter is incorrect|cannot find the file|A rendszer nem tal') {
+                    # Hive was never loaded or is already unloaded. Treat as success.
+                    $results.Add($hiveName) | Out-Null
+                    $unloaded = $true
+                }
+            }
+
+            # Phase 2: native RegUnLoadKey fallback.
+            if (-not $unloaded -and ('Win32.AdvApi32' -as [type])) {
+                try {
+                    [GC]::Collect()
+                    [GC]::WaitForPendingFinalizers()
+                    Start-Sleep -Milliseconds 750
+
+                    # HKEY_LOCAL_MACHINE = 0x80000002
+                    $hklm = [IntPtr]::new([int64]0x80000002)
+                    $subKey = $hiveName -replace '^HKLM\\',''
+                    $rc = [Win32.AdvApi32]::RegUnLoadKey($hklm, $subKey)
+                    if ($rc -eq 0) {
+                        $results.Add($hiveName) | Out-Null
+                        $unloaded = $true
+                    } else {
+                        $lastOutput = "RegUnLoadKey failed with Win32 error $rc"
+                    }
+                } catch {
+                    $lastOutput = "Native RegUnLoadKey threw: $($_.Exception.Message)"
+                }
+            }
+
+            if (-not $unloaded) {
+                $msg = if ([string]::IsNullOrWhiteSpace($lastOutput)) { "reg.exe unload failed after all attempts" } else { $lastOutput }
+                Write-WarningMsg "Failed to unload hive $hiveName after all attempts: $msg"
+            }
+        }
+    }
+
+    return $results
+}
+
 function Invoke-OfflineRegistryCleanup {
     <#
     .SYNOPSIS
-        Loads the offline SOFTWARE/SYSTEM/DEFAULT/user hives, runs a cleanup action,
-        and unloads every hive that was successfully mounted. An unload failure is
-        reported without masking an earlier action failure.
+        Loads the offline SOFTWARE/SYSTEM/DEFAULT/user hives, runs a cleanup
+        action, and unloads every hive that was successfully mounted.
 
     .DESCRIPTION
-        The PowerShell registry provider holds open handles to keys under a
-        loaded hive for as long as any managed object (e.g. the results of
-        Get-ChildItem or Get-ItemProperty) still references them. Those handles
-        prevent reg.exe from unloading the hive even after the action that
-        acquired them has returned. Forcing a full garbage collection before the
-        unload releases the references, and a short settle delay gives the
-        provider's finalizer thread time to close the underlying RegCloseKey
-        calls. A second GC after a successful unload ensures the next caller
-        starts from a clean handle state.
+        Multi-pass unload: after the first attempt, up to two more full passes
+        are tried with forced GC and settle delays between them. This defeats
+        the PowerShell registry provider's handle caching, which prevents
+        reg.exe from unloading a hive even after the action has returned.
     #>
     param(
         [Parameter(Mandatory)][scriptblock]$Action
@@ -755,8 +726,7 @@ function Invoke-OfflineRegistryCleanup {
     $loadedCleanupHives = [System.Collections.ArrayList]::new()
     $actionException = $null
     try {
-        # Recover from an interrupted previous run. reg.exe unload returns non-zero
-        # when an alias is not loaded; that is expected and intentionally ignored.
+        # Recover from an interrupted previous run.
         foreach ($staleHive in @($cleanupHives.Keys)) {
             $null = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('unload', $staleHive)
         }
@@ -777,19 +747,25 @@ function Invoke-OfflineRegistryCleanup {
     }
     finally {
         if ($loadedCleanupHives.Count -gt 0) {
-            # Force the PowerShell registry provider to release every handle it
-            # acquired during the action. Without this, reg.exe unload fails
-            # with "access denied" because the provider still has open keys
-            # under the hive, and the mount directory cannot be released for
-            # the later DISM discard.
-            $null = [GC]::Collect()
-            $null = [GC]::WaitForPendingFinalizers()
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
             Start-Sleep -Milliseconds 500
 
             $remaining = [System.Collections.ArrayList]::new()
             foreach ($hiveName in @($loadedCleanupHives)) { [void]$remaining.Add($hiveName) }
-            $unloaded = @(Invoke-RegistryHiveOperations -Operation Unload -Hives $remaining)
-            foreach ($hiveName in @($unloaded)) { [void]$remaining.Remove($hiveName) }
+
+            # Up to 3 full unload passes with GC between each pass.
+            for ($pass = 1; $pass -le 3 -and $remaining.Count -gt 0; $pass++) {
+                if ($pass -gt 1) {
+                    Write-WarningMsg "Retrying hive unload (pass $pass/3) for: $($remaining -join ', ')"
+                    [GC]::Collect()
+                    [GC]::WaitForPendingFinalizers()
+                    Start-Sleep -Seconds 2
+                }
+
+                $unloaded = @(Invoke-RegistryHiveOperations -Operation Unload -Hives @($remaining))
+                foreach ($hiveName in @($unloaded)) { [void]$remaining.Remove($hiveName) }
+            }
 
             if ($remaining.Count -gt 0) {
                 $message = "Failed to unload one or more temporary cleanup hives. Still loaded: $($remaining -join ', ')"
@@ -799,99 +775,12 @@ function Invoke-OfflineRegistryCleanup {
                 }
             }
 
-            # Drop the collection so the next cleanup run starts from a clean slate.
             $loadedCleanupHives = [System.Collections.ArrayList]::new()
 
-            # Second GC pass: the successful unload closed the hive handles, but
-            # the provider may still be holding managed wrappers. Clearing them
-            # here prevents the next Invoke-OfflineRegistryCleanup call (OneDrive,
-            # for example) from inheriting a stale handle state.
-            $null = [GC]::Collect()
-            $null = [GC]::WaitForPendingFinalizers()
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
         }
     }
-}
-
-function Invoke-RegistryHiveOperations {
-    <#
-    .SYNOPSIS
-        Sequentially loads or unloads registry hives (NOT thread-safe).
-
-    .PARAMETER Hives
-        For Load:   Hashtable of HiveName = HiveFilePath.
-        For Unload: Collection of HiveName strings (e.g. from a previous Load call).
-    #>
-    param(
-        [Parameter(Mandatory)][ValidateSet('Load','Unload')][string]$Operation,
-        [Parameter(Mandatory)][object]$Hives
-    )
-
-    $results = [System.Collections.ArrayList]::new()
-
-    if ($Operation -eq 'Load') {
-        # Accept either a hashtable (Name=Path) or a dictionary.
-        $keys = if ($Hives -is [hashtable] -or $Hives -is [System.Collections.IDictionary]) {
-            @($Hives.Keys)
-        } else {
-            throw "For -Operation Load, -Hives must be a hashtable/dictionary of HiveName = HiveFilePath."
-        }
-
-        foreach ($hiveName in $keys) {
-            $hivePath = $Hives[$hiveName]
-
-            if (Test-Path -LiteralPath $hivePath) {
-                $loadResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @(
-                    'load', $hiveName, $hivePath
-                )
-
-                if ($loadResult.ExitCode -eq 0) {
-                    $results.Add($hiveName) | Out-Null
-                } else {
-                    Write-WarningMsg "Failed to load hive $hiveName from $hivePath (reg.exe exit code $($loadResult.ExitCode)): $($loadResult.Output -join ' ')"
-                }
-            } else {
-                Write-WarningMsg "Hive file not found: $hivePath (skipping $hiveName)"
-            }
-        }
-    } else {
-        # Unload each hive sequentially. Retry transient locks up to 3 times.
-        foreach ($hiveName in @($Hives)) {
-            if ([string]::IsNullOrWhiteSpace($hiveName)) {
-                continue
-            }
-
-            $unloaded = $false
-            $unloadResult = $null
-
-            for ($attempt = 1; $attempt -le 3 -and -not $unloaded; $attempt++) {
-                $unloadResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @(
-                    'unload', $hiveName
-                )
-
-                if ($unloadResult.ExitCode -eq 0) {
-                    $results.Add($hiveName) | Out-Null
-                    $unloaded = $true
-                } else {
-                    if ($attempt -lt 3) {
-                        Start-Sleep -Milliseconds 500
-                    }
-                }
-            }
-
-            if (-not $unloaded) {
-                $message = if ($unloadResult) { ($unloadResult.Output -join ' ').Trim() } else { '' }
-
-                if ([string]::IsNullOrWhiteSpace($message)) {
-                    $code = if ($unloadResult) { $unloadResult.ExitCode } else { 'unknown' }
-                    $message = "reg.exe exit code $code"
-                }
-
-                Write-WarningMsg "Failed to unload hive $hiveName after 3 attempts: $message"
-            }
-        }
-    }
-
-    return $results
 }
 
 function Get-ImageArchitecture {
@@ -902,9 +791,6 @@ function Get-ImageArchitecture {
     $image = Get-WindowsImage -ImagePath $ImagePath -Index $Index -ErrorAction Stop
     if (-not $image) { throw "Could not retrieve image metadata for index $Index from '$ImagePath'." }
 
-    # DISM exposes DismImageInfo.Architecture as a numeric enum. In particular,
-    # 9 = amd64/x64 and 12 = arm64. Older/custom wrappers may expose strings,
-    # so accept both representations.
     $architecture = $image.Architecture
     if ($architecture -is [string]) {
         switch -Regex ($architecture.Trim()) {
@@ -925,12 +811,6 @@ function Get-ImageArchitecture {
 }
 
 function Get-OfflineActiveControlSet {
-    <#
-    .SYNOPSIS
-        Reads SYSTEM\Select\Current from the loaded offline SYSTEM hive.
-    .OUTPUTS
-        String such as ControlSet001.
-    #>
     $result = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @(
         'query', 'HKLM\zSYSTEM\Select', '/v', 'Current'
     )
@@ -1054,20 +934,6 @@ function Invoke-WindowsImageDiscardRobust {
 }
 
 function Invoke-WindowsImageDismountRobust {
-    <#
-    .SYNOPSIS
-        Dismounts an offline Windows image with retry/backoff and a native DISM
-        fallback. Windows Defender, Search indexing, registry-provider handles,
-        and transient DISM provider locks can otherwise make Dismount-WindowsImage
-        fail with ERROR_SHARING_VIOLATION ("file is being used by another process").
-
-    .DESCRIPTION
-        The function deliberately does NOT delete or rename anything after a
-        failed dismount. It retries the commit operation, forces managed-object
-        cleanup between attempts, and finally asks native dism.exe to perform the
-        same commit. The caller's mount-state flag is changed only after a
-        successful dismount.
-    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$MountPath,
@@ -1081,9 +947,6 @@ function Invoke-WindowsImageDismountRobust {
 
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            # Release PowerShell/registry-provider objects before asking DISM to
-            # finalize the image. This is especially important after offline
-            # registry work and Get-ChildItem/Get-ItemProperty enumeration.
             [GC]::Collect()
             [GC]::WaitForPendingFinalizers()
             Start-Sleep -Seconds ([math]::Min(10, [math]::Max(1, $InitialDelaySeconds * $attempt)))
@@ -1103,15 +966,11 @@ function Invoke-WindowsImageDismountRobust {
             Write-WarningMsg "Dismount attempt $attempt/$Attempts failed: $message"
 
             if ($attempt -lt $Attempts) {
-                # Give antivirus/indexing/DISM provider threads time to release
-                # handles. Do not remove, rename, or recreate the mount directory.
                 Start-Sleep -Seconds ([math]::Min(15, $InitialDelaySeconds * ($attempt + 1)))
             }
         }
     }
 
-    # Final fallback: use native DISM. This avoids depending on the PowerShell
-    # DISM provider after it has already reported a provider/handle problem.
     try {
         Write-WarningMsg "PowerShell Dismount-WindowsImage remained locked; trying native DISM /Unmount-Wim /Commit..."
 
@@ -1185,13 +1044,6 @@ function Convert-WindowsProcessArgument {
 }
 
 function Select-WindowsImageIndex {
-    <#
-    .SYNOPSIS
-        Selects an image index either from -ImageIndex param, auto-detect via regex,
-        or interactive prompt.
-    .OUTPUTS
-        Int index, or $null on failure.
-    #>
     param(
         [Parameter(Mandatory)][array]$Images,
         [Parameter(Mandatory)][int]$PreferredIndex,
@@ -1220,7 +1072,6 @@ function Select-WindowsImageIndex {
 
     if ($QuietMode) {
         Write-ErrorMessage "QuietMode requires -ImageIndex when '$ProRegex' cannot be auto-detected."
-        # Return $null; callers should test with $null -eq.
         return $null
     }
 
@@ -1243,9 +1094,6 @@ function Select-WindowsImageIndex {
 Clear-Host
 $ErrorActionPreference = "Stop"
 
-# PowerShell 7.3+ only; harmless on 5.1. Prevents native-command stderr from
-# being promoted to a terminating error at the engine level. Belt-and-suspenders
-# with Invoke-NativeCommand.
 if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
     $PSNativeCommandUseErrorActionPreference = $false
 }
@@ -1254,7 +1102,7 @@ $script:Host.UI.RawUI.WindowTitle = $script:VersionInfo.WindowTitle
 
 Write-Banner "Gaming Windows Image Creator v$($script:VersionInfo.FullVersion) ($($script:VersionInfo.Codename))"
 
-# ---- Resolve ScratchDisk to just the drive letter ----
+# ---- Resolve ScratchDisk ----
 if (-not $ScratchDisk) {
     $resolvedScratch = Resolve-DriveLetter -InputValue $PSScriptRoot
     if (-not $resolvedScratch) {
@@ -1309,9 +1157,6 @@ if ($cancelledForLowScratchSpace) {
 Write-Ok "Scratch disk set to $ScratchDisk"
 
 # ==================== EXECUTION POLICY CHECK ====================
-# Do not mutate the user's persistent PowerShell policy. The elevated child below
-# is launched with -ExecutionPolicy Bypass, so changing CurrentUser policy is
-# unnecessary and creates an unwanted side effect.
 if ((Get-ExecutionPolicy) -eq 'Restricted') {
     Write-WarningMsg "Effective Execution Policy is Restricted; continuing without changing the user's policy."
 }
@@ -1343,7 +1188,6 @@ if (-not $myWindowsPrincipal.IsInRole($adminRole)) {
     if ($PSBoundParameters.ContainsKey('ProImageRegex')) {
         $argList += @('-ProImageRegex', $ProImageRegex)
     }
-    # Forward -ExportCompression when the caller explicitly set it.
     if ($PSBoundParameters.ContainsKey('ExportCompression')) {
         $argList += @('-ExportCompression', $ExportCompression)
     }
@@ -1366,8 +1210,6 @@ if (-not $myWindowsPrincipal.IsInRole($adminRole)) {
             throw "The elevated PowerShell process could not be started."
         }
 
-        # Wait for the elevated child to finish and propagate its real exit code
-        # instead of always returning success from the non-elevated parent.
         $elevatedProcess.WaitForExit()
         $elevatedExitCode = $elevatedProcess.ExitCode
         $elevatedProcess.Dispose()
@@ -1381,9 +1223,6 @@ if (-not $myWindowsPrincipal.IsInRole($adminRole)) {
 # ==================== PRE-FLIGHT CHECKS ====================
 Write-Banner "Pre-flight Checks"
 
-# Verify the DISM PowerShell module/cmdlets before touching the source media.
-# Failing here is preferable to discovering a missing servicing component after
-# a WIM has already been copied or mounted.
 try {
     Import-Module Dism -ErrorAction Stop
     foreach ($requiredCommand in @(
@@ -1412,9 +1251,6 @@ if (-not (Test-Path $autoUnattendPath)) {
 try {
     [xml]$autoUnattendXml = Get-Content $autoUnattendPath -ErrorAction Stop
 
-    # Windows documents OOBE automation through the oobeSystem unattend pass.
-    # This builder intentionally targets an offline/local-account setup, so do not
-    # rely on the legacy/optional BypassNRO registry switch as the primary path.
     $oobePath = "//*[local-name()='settings'][@pass='oobeSystem']/*[local-name()='component'][@name='Microsoft-Windows-Shell-Setup']/*[local-name()='OOBE']"
     $hideOnlineAccountNode = $autoUnattendXml.SelectSingleNode($oobePath + "/*[local-name()='HideOnlineAccountScreens']")
     $hideWirelessNode     = $autoUnattendXml.SelectSingleNode($oobePath + "/*[local-name()='HideWirelessSetupInOOBE']")
@@ -1426,8 +1262,6 @@ try {
         throw "autounattend.xml must set Microsoft-Windows-Shell-Setup/OOBE/HideWirelessSetupInOOBE to true."
     }
 
-    # HideOnlineAccountScreens suppresses the online-account UI; it does not create
-    # a local user. Require an explicit Shell-Setup/UserAccounts/LocalAccounts entry.
     $localAccountPath = "//*[local-name()='component'][@name='Microsoft-Windows-Shell-Setup']/*[local-name()='UserAccounts']/*[local-name()='LocalAccounts']/*[local-name()='LocalAccount']"
     $localAccountNodes = @($autoUnattendXml.SelectNodes($localAccountPath))
     if ($localAccountNodes.Count -eq 0) {
@@ -1441,9 +1275,6 @@ try {
 }
 
 # --- OSCDIMG ---
-# OSCDIMG is a Windows ADK deployment tool. Do not download an executable from
-# an undocumented symbol-server URL: require a locally installed/supplied copy
-# and validate its Authenticode signature before use.
 $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
 $adkRoot = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools"
 $adkCandidates = @()
@@ -1494,13 +1325,9 @@ $MOUNT_DIR     = Join-Path "$ScratchDisk\" "scratchdir"
 $WIM_PATH      = Join-Path $WORK_DIR "sources\install.wim"
 $BOOT_WIM_PATH = Join-Path $WORK_DIR "sources\boot.wim"
 
-# Build stages are kept fixed; conditional stages
-# still occupy their slot when skipped so progress remains stable.
 $totalSteps   = 15
 $mainProgress = [ProgressTracker]::new("Building Gaming Windows ISO", $totalSteps, $script:ShowProgress)
 
-# Transaction state. These are initialized BEFORE the try so the finally block can
-# safely recover from failures occurring at any point in the build.
 $loadedHives = [System.Collections.ArrayList]::new()
 $loadedBootHives = [System.Collections.ArrayList]::new()
 $mainImageMounted = $false
@@ -1511,9 +1338,6 @@ $bootOrderPath = $null
 $buildSucceeded = $false
 
 # ==================== BUILD TRANSACTION ====================
-# Everything from source selection through ISO creation is inside one transaction.
-# This guarantees cleanup also runs for failures during copy, staging, servicing,
-# or ISO creation.
 try {
 
 # ==================== SELECT SOURCE DRIVE ====================
@@ -1529,7 +1353,6 @@ if ($SourceDrive) {
 } elseif ($QuietMode) {
     throw "QuietMode requires -SourceDrive to be specified."
 } else {
-    # [FIX] Renamed $input -> $userInput to avoid clobbering the automatic variable.
     do {
         $userInput = Read-Host "Please enter the drive letter for the Windows 11 installation media (e.g., D)"
         $resolved  = Resolve-DriveLetter -InputValue $userInput
@@ -1543,13 +1366,10 @@ if ($SourceDrive) {
     } while ($true)
 }
 
-# Source and scratch must be different drives. Using the same drive can
-# cause recursive copying / exhaustion of free space and can corrupt the build.
 if ($DriveLetter.TrimEnd(':\').ToUpperInvariant() -eq $ScratchDisk.TrimEnd(':\').ToUpperInvariant()) {
     throw "SourceDrive and ScratchDisk must be different drives. SourceDrive=$DriveLetter, ScratchDisk=$ScratchDisk"
 }
 
-# Validate source media
 $installWimPath = Join-Path $DriveLetter "sources\install.wim"
 $installEsdPath = Join-Path $DriveLetter "sources\install.esd"
 if (-not (Test-Path $installWimPath) -and -not (Test-Path $installEsdPath)) {
@@ -1560,8 +1380,6 @@ $mainProgress.CompleteStep()
 # ==================== CREATE DIRECTORY STRUCTURE ====================
 $mainProgress.StartStep("Creating directory structure")
 
-# DISM mount registration survives ordinary directory deletion. Recover all
-# build-related stale mounts before touching the work tree or mount directory.
 Invoke-StaleBuildMountRecovery -MountPath $MOUNT_DIR -WimPath $WIM_PATH -Attempts 3
 
 foreach ($staleDir in @($WORK_DIR, $MOUNT_DIR)) {
@@ -1574,11 +1392,7 @@ foreach ($staleDir in @($WORK_DIR, $MOUNT_DIR)) {
 New-Item -ItemType Directory -Force -Path (Join-Path $WORK_DIR "sources") -ErrorAction Stop | Out-Null
 New-Item -ItemType Directory -Force -Path $MOUNT_DIR -ErrorAction Stop | Out-Null
 
-# ---- Copy optional OEM overlay into the build tree ----
-# The OEM folder next to the script mirrors the ISO root. Anything under OEM\
-# ends up under $WORK_DIR\; for example, sources\$OEM$\$1\Setup\ lands at
-# C:\Setup\ on the installed system. The overlay is optional so builds do
-# not depend on any optional first-boot payload.
+# ---- Copy optional OEM overlay ----
 $oemOverlaySource = Join-Path $PSScriptRoot 'OEM'
 $oemOverlayDest   = Join-Path $WORK_DIR 'sources'
 if (Test-Path -LiteralPath $oemOverlaySource -PathType Container) {
@@ -1622,10 +1436,6 @@ $mainProgress.CompleteStep()
 $mainProgress.StartStep("Checking available space")
 $sourceRoot = "$DriveLetter\"
 
-# Estimate the scratch requirement from the exact source tree that Robocopy copies.
-# Robocopy uses /E and excludes only install.wim/install.esd, so the preflight must
-# inspect the same tree; otherwise protected/extra files on the media can be omitted
-# from the estimate and the build can run out of scratch space mid-copy.
 $sourceScanErrors = @()
 $sourceFiles = @(Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable +sourceScanErrors |
     Where-Object { $_.FullName -ne $installWimPath -and $_.FullName -ne $installEsdPath })
@@ -1643,8 +1453,6 @@ if ($sourceScanErrors.Count -gt 0) {
     Write-WarningMsg "The estimate may be low; Robocopy remains the authoritative source-copy check."
 }
 $availableSpace = (Get-PSDrive -Name $ScratchDisk.Substring(0,1) -ErrorAction Stop).Free
-# The staged WIM and final WIM can coexist with copied media and the mounted image.
-# Use the source image size as an additional baseline and reserve generous headroom.
 $estimatedRequiredSpace = [math]::Ceiling((($requiredMediaSpace * 2.5) + ($sourceImageSize * 2.5)) + 10GB)
 if ($availableSpace -lt $estimatedRequiredSpace) {
     Write-WarningMsg "Available space ($([math]::Round($availableSpace/1GB,2))GB) < estimated build requirement ($([math]::Round($estimatedRequiredSpace/1GB,2))GB)"
@@ -1655,10 +1463,6 @@ if ($availableSpace -lt $estimatedRequiredSpace) {
 $mainProgress.CompleteStep()
 
 # ==================== SELECT AND STAGE INSTALL IMAGE ====================
-# Inspect the source WIM/ESD directly first. The large install image is exported
-# directly into the build tree instead of being copied once into a separate source staging directory and
-# then copied/exported again. This substantially reduces scratch usage and failure
-# surface while preserving the selected-image behavior.
 $mainProgress.StartStep("Selecting and staging install image")
 
 $sourceWimPath = Join-Path $DriveLetter "sources\install.wim"
@@ -1693,8 +1497,6 @@ if ($sourceArchitecture -ne 'amd64') {
 }
 Write-Ok "Selected image: $($selectedSourceImage.ImageName) (Index $sourceIndex, Architecture $sourceArchitecture)"
 
-# Always create a single-image WIM for the build. This makes downstream servicing
-# deterministic: the selected image is always WIM index 1.
 Write-Step "Exporting selected image to the build WIM..."
 $stageWimPath = Join-Path $WORK_DIR "sources\install.wim"
 if (Test-Path -LiteralPath $stageWimPath) {
@@ -1725,10 +1527,6 @@ $mainProgress.CompleteStep()
 $mainProgress.StartStep("Copying source files to scratch disk")
 Write-Step "Copying Windows installation media to $WORK_DIR"
 Write-Step "The large install.wim/install.esd is excluded because it was staged directly above."
-
-# Copy the media tree directly into WORK_DIR. Exclude the installation images because
-# install.wim was already staged as the selected single-image WIM.
-# IMPORTANT: use D:\ rather than D:; the latter is drive-relative.
 
 $robocopyArgs = @(
     $sourceRoot,
@@ -1766,7 +1564,6 @@ if (-not (Test-Path -LiteralPath $WIM_PATH)) {
     throw "Staged sources\install.wim was not created."
 }
 
-# Regression guard: the source copy must never replace the staged WIM.
 $postCopyImages = @(Get-WindowsImage -ImagePath $WIM_PATH -ErrorAction Stop)
 if ($postCopyImages.Count -ne 1 -or $postCopyImages[0].ImageIndex -ne 1) {
     throw "Source copy altered the staged install.wim; expected exactly one image at index 1."
@@ -1862,9 +1659,6 @@ $index = $null
         })
 
         if ($packagesToRemove.Count -gt 0) {
-            # DISM operations against the SAME offline image MUST be
-            # sequential. Running them in parallel corrupts the image or returns
-            # ERROR_BUSY (0x800700AA).
             $removedCount = 0
             $failedPackages = [System.Collections.Generic.List[string]]::new()
             $currentPkg   = 0
@@ -1894,557 +1688,511 @@ $index = $null
             Write-WarningMsg "No bloatware packages found to remove."
         }
 
-		# ---------------------------------------------------------------------
-		# Removal of facial recognition, handwriting/speech recognition, and Recall
-		# ---------------------------------------------------------------------
-		Write-Step "Removing specialized Windows capabilities (Face Recognition, Handwriting, Speech)..."
-		
-		# 1. Query available Windows capabilities from the offline image
-		$capResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
-		    '/English', "/image:$MOUNT_DIR", '/Get-Capabilities'
-		)
-		
-		if ($capResult.ExitCode -eq 0) {
-		
-		    # Extract handwriting, speech, and face recognition capabilities
-		    $capsToRemove = @(
-		        $capResult.Output | ForEach-Object {
-		            if ($_ -match 'Capability Identity\s*:\s*(.*)') {
-		                $matches[1].Trim()
-		            }
-		        } | Where-Object {
-		            $_ -match '(?i)Language\.Handwriting' -or
-		            $_ -match '(?i)Language\.Speech' -or
-		            $_ -match '(?i)WinBio\.Face'
-		        }
-		    )
-		
-		    if ($capsToRemove.Count -gt 0) {
-		        $currentCap = 0
-		
-		        foreach ($cap in $capsToRemove) {
-		            $currentCap++
-		
-		            Write-ProgressSafe -Activity "Removing Windows Capabilities" `
-		                -Status "($currentCap/$($capsToRemove.Count)) $cap" `
-		                -PercentComplete (($currentCap / $capsToRemove.Count) * 100)
-		
-		            $capRemoveResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
-		                '/English',
-		                "/image:$MOUNT_DIR",
-		                '/Remove-Capability',
-		                "/CapabilityName:$cap"
-		            )
-		
-		            if ($capRemoveResult.ExitCode -eq 0) {
-		                Write-Ok "Successfully removed capability: $cap"
-		            }
-		            else {
-		                Write-WarningMsg "Failed to remove capability: $cap (DISM exit code $($capRemoveResult.ExitCode))"
-		            }
-		        }
-		
-		        Write-ProgressSafe -Activity "Removing Windows Capabilities" -Completed
-		    }
-		    else {
-		        Write-Step "No matching Speech, Handwriting, or Face capabilities found."
-		    }
-		}
-		else {
-		    Write-WarningMsg "Failed to enumerate Windows Capabilities (DISM exit code $($capResult.ExitCode))."
-		}
-		
-		# 2. Disable and remove the Windows Recall feature
-		Write-Step "Disabling Windows Recall feature..."
-		
-		$recallResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
-		    '/English',
-		    "/image:$MOUNT_DIR",
-		    '/Disable-Feature',
-		    '/FeatureName:Recall',
-		    '/Remove'
-		)
-		
-		if ($recallResult.ExitCode -eq 0) {
-		    Write-Ok "Windows Recall successfully disabled and binaries queued for removal."
-		}
-		else {
-		    # Recall may not exist in older Windows 11 images.
-		    # Treat this as a warning rather than a critical error.
-		    Write-WarningMsg "Windows Recall feature was not found or could not be disabled. (Normal on older Windows 11 builds)."
-		}
-		
-		$mainProgress.CompleteStep()
-		}
-		else {
-		    $mainProgress.StartStep("Skipping bloatware removal")
-		    Write-WarningMsg "Skipping bloatware removal."
-		    $mainProgress.CompleteStep()
-		}
+        # ---------------------------------------------------------------------
+        # Removal of facial recognition, handwriting/speech recognition, and Recall
+        # ---------------------------------------------------------------------
+        Write-Step "Removing specialized Windows capabilities (Face Recognition, Handwriting, Speech)..."
+        
+        $capResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+            '/English', "/image:$MOUNT_DIR", '/Get-Capabilities'
+        )
+        
+        if ($capResult.ExitCode -eq 0) {
+        
+            $capsToRemove = @(
+                $capResult.Output | ForEach-Object {
+                    if ($_ -match 'Capability Identity\s*:\s*(.*)') {
+                        $matches[1].Trim()
+                    }
+                } | Where-Object {
+                    $_ -match '(?i)Language\.Handwriting' -or
+                    $_ -match '(?i)Language\.Speech' -or
+                    $_ -match '(?i)WinBio\.Face'
+                }
+            )
+        
+            if ($capsToRemove.Count -gt 0) {
+                $currentCap = 0
+        
+                foreach ($cap in $capsToRemove) {
+                    $currentCap++
+        
+                    Write-ProgressSafe -Activity "Removing Windows Capabilities" `
+                        -Status "($currentCap/$($capsToRemove.Count)) $cap" `
+                        -PercentComplete (($currentCap / $capsToRemove.Count) * 100)
+        
+                    $capRemoveResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+                        '/English',
+                        "/image:$MOUNT_DIR",
+                        '/Remove-Capability',
+                        "/CapabilityName:$cap"
+                    )
+        
+                    if ($capRemoveResult.ExitCode -eq 0) {
+                        Write-Ok "Successfully removed capability: $cap"
+                    }
+                    else {
+                        Write-WarningMsg "Failed to remove capability: $cap (DISM exit code $($capRemoveResult.ExitCode))"
+                    }
+                }
+        
+                Write-ProgressSafe -Activity "Removing Windows Capabilities" -Completed
+            }
+            else {
+                Write-Step "No matching Speech, Handwriting, or Face capabilities found."
+            }
+        }
+        else {
+            Write-WarningMsg "Failed to enumerate Windows Capabilities (DISM exit code $($capResult.ExitCode))."
+        }
+        
+        Write-Step "Disabling Windows Recall feature..."
+        
+        $recallResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+            '/English',
+            "/image:$MOUNT_DIR",
+            '/Disable-Feature',
+            '/FeatureName:Recall',
+            '/Remove'
+        )
+        
+        if ($recallResult.ExitCode -eq 0) {
+            Write-Ok "Windows Recall successfully disabled and binaries queued for removal."
+        }
+        else {
+            Write-WarningMsg "Windows Recall feature was not found or could not be disabled. (Normal on older Windows 11 builds)."
+        }
+        
+        $mainProgress.CompleteStep()
+    }
+    else {
+        $mainProgress.StartStep("Skipping bloatware removal")
+        Write-WarningMsg "Skipping bloatware removal."
+        $mainProgress.CompleteStep()
+    }
 
     # ==================== REMOVE EDGE / EDGEUPDATE / WEBVIEW2 ====================
-    # Full removal is intentional. Microsoft documents the Evergreen WebView2 Runtime
-    # under Program Files (x86)\Microsoft\EdgeWebView and identifies its registration
-    # under the EdgeUpdate\Clients\{F301...} key. This build removes those user/desktop
-    # runtime components, EdgeUpdate services/tasks/registrations, and Edge browser
-    # payload/registrations. OS-owned WebView2 binaries loaded directly from System32
-    # are deliberately not altered because Microsoft identifies those as Windows-owned
-    # and serviced by Windows Update.
-    
-        $mainProgress.StartStep("Removing Microsoft Edge, EdgeUpdate and WebView2")
-        Write-Step "Removing Microsoft Edge, EdgeUpdate and WebView2 components..."
+    $mainProgress.StartStep("Removing Microsoft Edge, EdgeUpdate and WebView2")
+    Write-Step "Removing Microsoft Edge, EdgeUpdate and WebView2 components..."
 
-        $edgeComponentPaths = @(
-            "$MOUNT_DIR\Program Files (x86)\Microsoft\Edge",
-            "$MOUNT_DIR\Program Files\Microsoft\Edge",
-            "$MOUNT_DIR\Program Files (x86)\Microsoft\EdgeWebView",
-            "$MOUNT_DIR\Program Files\Microsoft\EdgeWebView",
-            "$MOUNT_DIR\Program Files (x86)\Microsoft\EdgeUpdate",
-            "$MOUNT_DIR\Program Files\Microsoft\EdgeUpdate",
-            "$MOUNT_DIR\ProgramData\Microsoft\EdgeUpdate",
-            "$MOUNT_DIR\ProgramData\Microsoft\EdgeWebView"
+    $edgeComponentPaths = @(
+        "$MOUNT_DIR\Program Files (x86)\Microsoft\Edge",
+        "$MOUNT_DIR\Program Files\Microsoft\Edge",
+        "$MOUNT_DIR\Program Files (x86)\Microsoft\EdgeWebView",
+        "$MOUNT_DIR\Program Files\Microsoft\EdgeWebView",
+        "$MOUNT_DIR\Program Files (x86)\Microsoft\EdgeUpdate",
+        "$MOUNT_DIR\Program Files\Microsoft\EdgeUpdate",
+        "$MOUNT_DIR\ProgramData\Microsoft\EdgeUpdate",
+        "$MOUNT_DIR\ProgramData\Microsoft\EdgeWebView"
+    )
+    foreach ($path in $edgeComponentPaths) {
+        if (Test-Path -LiteralPath $path) {
+            if (-not (Invoke-TakeOwnership -Path $path -Recurse)) {
+                throw "Failed to take ownership of Edge/EdgeUpdate/WebView2 directory '$path'."
+            }
+            if (-not (Remove-PathSafe -Path $path)) {
+                throw "Failed to remove Edge/EdgeUpdate/WebView2 directory '$path'."
+            }
+        }
+    }
+
+    $edgeExtras = @(
+        "$MOUNT_DIR\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk",
+        "$MOUNT_DIR\Users\Public\Desktop\Microsoft Edge.lnk",
+        "$MOUNT_DIR\Users\Default\Desktop\Microsoft Edge.lnk",
+        "$MOUNT_DIR\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk"
+    )
+    foreach ($p in $edgeExtras) {
+        if (Test-Path -LiteralPath $p -PathType Leaf) {
+            if (-not (Remove-PathSafe -Path $p -Silent)) { throw "Could not remove Edge shortcut '$p'." }
+        }
+    }
+
+    $taskFilesRoot = Join-Path $MOUNT_DIR 'Windows\System32\Tasks'
+    if (Test-Path -LiteralPath $taskFilesRoot) {
+        $edgeTasks = @(Get-ChildItem -LiteralPath $taskFilesRoot -Recurse -File -Force -ErrorAction Stop | Where-Object {
+            $_.Name -match '(?i)^MicrosoftEdge(Update|Elevation|WebView).*|^MicrosoftEdgeUpdateTask' -or
+            $_.FullName -match '(?i)\\EdgeUpdate(\\|$)'
+        })
+        foreach ($task in $edgeTasks) {
+            if (-not (Invoke-TakeOwnership -Path $task.FullName)) {
+                throw "Failed to take ownership of Edge/EdgeUpdate task file '$($task.FullName)'."
+            }
+            if (-not (Remove-PathSafe -Path $task.FullName -Silent)) {
+                throw "Could not remove Edge/EdgeUpdate task file '$($task.FullName)'."
+            }
+        }
+    }
+
+    Invoke-OfflineRegistryCleanup -Action {
+        param($cleanupHiveNames)
+
+        Remove-OfflineScheduledTasksByName -SystemHive 'HKLM\zCLEAN_SYSTEM' -NameRegex @(
+            '(?i)^MicrosoftEdgeUpdateTask',
+            '(?i)^MicrosoftEdgeElevation',
+            '(?i)EdgeUpdate'
         )
-        foreach ($path in $edgeComponentPaths) {
-            if (Test-Path -LiteralPath $path) {
-                if (-not (Invoke-TakeOwnership -Path $path -Recurse)) {
-                    throw "Failed to take ownership of Edge/EdgeUpdate/WebView2 directory '$path'."
-                }
-                if (-not (Remove-PathSafe -Path $path)) {
-                    throw "Failed to remove Edge/EdgeUpdate/WebView2 directory '$path'."
-                }
-            }
-        }
 
-        # Remove installer/setup remnants and start-menu shortcuts from the image.
-        $edgeExtras = @(
-            "$MOUNT_DIR\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk",
-            "$MOUNT_DIR\Users\Public\Desktop\Microsoft Edge.lnk",
-            "$MOUNT_DIR\Users\Default\Desktop\Microsoft Edge.lnk",
-            "$MOUNT_DIR\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk"
-        )
-        foreach ($p in $edgeExtras) {
-            if (Test-Path -LiteralPath $p -PathType Leaf) {
-                if (-not (Remove-PathSafe -Path $p -Silent)) { throw "Could not remove Edge shortcut '$p'." }
-            }
-        }
-
-        # Edge Update scheduled tasks are normally stored at the root of System32\Tasks
-        # (e.g. MicrosoftEdgeUpdateTaskMachineCore / ...UA).
-        # Remove the task files by name and clean all TaskCache links.
-        $taskFilesRoot = Join-Path $MOUNT_DIR 'Windows\System32\Tasks'
-        if (Test-Path -LiteralPath $taskFilesRoot) {
-            $edgeTasks = @(Get-ChildItem -LiteralPath $taskFilesRoot -Recurse -File -Force -ErrorAction Stop | Where-Object {
-                $_.Name -match '(?i)^MicrosoftEdge(Update|Elevation|WebView).*|^MicrosoftEdgeUpdateTask' -or
-                $_.FullName -match '(?i)\\EdgeUpdate(\\|$)'
-            })
-            foreach ($task in $edgeTasks) {
-                if (-not (Invoke-TakeOwnership -Path $task.FullName)) {
-                    throw "Failed to take ownership of Edge/EdgeUpdate task file '$($task.FullName)'."
-                }
-                if (-not (Remove-PathSafe -Path $task.FullName -Silent)) {
-                    throw "Could not remove Edge/EdgeUpdate task file '$($task.FullName)'."
-                }
-            }
-        }
-
-        Invoke-OfflineRegistryCleanup -Action {
-            param($cleanupHiveNames)
-
-            # Remove any Edge Update task-cache registrations left by the files above.
-            Remove-OfflineScheduledTasksByName -SystemHive 'HKLM\zCLEAN_SYSTEM' -NameRegex @(
-                '(?i)^MicrosoftEdgeUpdateTask',
-                '(?i)^MicrosoftEdgeElevation',
-                '(?i)EdgeUpdate'
-            )
-
-            # Remove Edge/WebView2 updater and Edge elevation services from every
-            # control set present in the offline SYSTEM hive.
-            $systemRoot = 'Registry::HKLM\zCLEAN_SYSTEM\'
-            $controlSets = @(Get-ChildItem -LiteralPath $systemRoot -Force -ErrorAction Stop |
-                Where-Object { $_.PSChildName -match '^ControlSet\d{3}$' })
-            foreach ($controlSet in $controlSets) {
-                foreach ($serviceName in @(
-                    'edgeupdate',
-                    'edgeupdatem',
-                    'MicrosoftEdgeElevationService'
-                )) {
-                    Remove-RegistryKeyIfExists -RegistryPath "HKLM\zCLEAN_SYSTEM\$($controlSet.PSChildName)\Services\$serviceName" -Description "Microsoft Edge service $serviceName"
-                }
-            }
-
-            # Remove machine-wide Edge browser, WebView2 and EdgeUpdate registrations.
-            $edgeRegistryKeys = @(
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Edge',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\EdgeUpdate',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Edge',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedgewebview2.exe',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedgewebview2.exe',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime',
-                'HKLM\zCLEAN_SOFTWARE\Clients\StartMenuInternet\Microsoft Edge',
-                'HKLM\zCLEAN_SOFTWARE\Classes\microsoft-edge',
-                'HKLM\zCLEAN_SOFTWARE\Classes\MSEdgeHTM',
-                'HKLM\zCLEAN_SOFTWARE\RegisteredApplications\Microsoft Edge',
-                'HKLM\zCLEAN_SOFTWARE\Policies\Microsoft\Edge',
-                'HKLM\zCLEAN_SOFTWARE\Policies\Microsoft\EdgeUpdate',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Policies\Microsoft\EdgeUpdate'
-            )
-            foreach ($key in $edgeRegistryKeys) {
-                if ($key -eq 'HKLM\zCLEAN_SOFTWARE\RegisteredApplications\Microsoft Edge') { continue }
-                Remove-RegistryKeyIfExists -RegistryPath $key -Description 'Microsoft Edge / EdgeUpdate / WebView2'
-            }
-            Remove-RegistryValueIfExists -RegistryPath 'HKLM\zCLEAN_SOFTWARE\RegisteredApplications' -ValueName 'Microsoft Edge' -Description 'Microsoft Edge RegisteredApplications entry'
-
-            foreach ($uninstallRoot in @(
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        $systemRoot = 'Registry::HKLM\zCLEAN_SYSTEM\'
+        $controlSets = @(Get-ChildItem -LiteralPath $systemRoot -Force -ErrorAction Stop |
+            Where-Object { $_.PSChildName -match '^ControlSet\d{3}$' })
+        foreach ($controlSet in $controlSets) {
+            foreach ($serviceName in @(
+                'edgeupdate',
+                'edgeupdatem',
+                'MicrosoftEdgeElevationService'
             )) {
-                $providerUninstallRoot = "Registry::$uninstallRoot"
-                if (Test-Path -LiteralPath $providerUninstallRoot) {
-                    foreach ($entry in @(Get-ChildItem -LiteralPath $providerUninstallRoot -Force -ErrorAction Stop)) {
-                        $displayName = $null
-                        try {
-                            $props = Get-ItemProperty -LiteralPath $entry.PSPath -ErrorAction Stop
-                            $displayName = [string]$props.DisplayName
-                        } catch {
-                            throw "Failed to inspect uninstall entry '$($entry.PSPath)': $($_.Exception.Message)"
-                        }
-                        if ($displayName -match '(?i)^Microsoft Edge( WebView2 Runtime| Update)?$') {
-                            Remove-RegistryKeyIfExists -RegistryPath "$uninstallRoot\$($entry.PSChildName)" -Description "Edge/WebView2 uninstall registration ($displayName)"
-                        }
+                Remove-RegistryKeyIfExists -RegistryPath "HKLM\zCLEAN_SYSTEM\$($controlSet.PSChildName)\Services\$serviceName" -Description "Microsoft Edge service $serviceName"
+            }
+        }
+
+        $edgeRegistryKeys = @(
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Edge',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\EdgeUpdate',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Edge',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedgewebview2.exe',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedgewebview2.exe',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime',
+            'HKLM\zCLEAN_SOFTWARE\Clients\StartMenuInternet\Microsoft Edge',
+            'HKLM\zCLEAN_SOFTWARE\Classes\microsoft-edge',
+            'HKLM\zCLEAN_SOFTWARE\Classes\MSEdgeHTM',
+            'HKLM\zCLEAN_SOFTWARE\RegisteredApplications\Microsoft Edge',
+            'HKLM\zCLEAN_SOFTWARE\Policies\Microsoft\Edge',
+            'HKLM\zCLEAN_SOFTWARE\Policies\Microsoft\EdgeUpdate',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Policies\Microsoft\EdgeUpdate'
+        )
+        foreach ($key in $edgeRegistryKeys) {
+            if ($key -eq 'HKLM\zCLEAN_SOFTWARE\RegisteredApplications\Microsoft Edge') { continue }
+            Remove-RegistryKeyIfExists -RegistryPath $key -Description 'Microsoft Edge / EdgeUpdate / WebView2'
+        }
+        Remove-RegistryValueIfExists -RegistryPath 'HKLM\zCLEAN_SOFTWARE\RegisteredApplications' -ValueName 'Microsoft Edge' -Description 'Microsoft Edge RegisteredApplications entry'
+
+        foreach ($uninstallRoot in @(
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        )) {
+            $providerUninstallRoot = "Registry::$uninstallRoot"
+            if (Test-Path -LiteralPath $providerUninstallRoot) {
+                foreach ($entry in @(Get-ChildItem -LiteralPath $providerUninstallRoot -Force -ErrorAction Stop)) {
+                    $displayName = $null
+                    try {
+                        $props = Get-ItemProperty -LiteralPath $entry.PSPath -ErrorAction Stop
+                        $displayName = [string]$props.DisplayName
+                    } catch {
+                        throw "Failed to inspect uninstall entry '$($entry.PSPath)': $($_.Exception.Message)"
+                    }
+                    if ($displayName -match '(?i)^Microsoft Edge( WebView2 Runtime| Update)?$') {
+                        Remove-RegistryKeyIfExists -RegistryPath "$uninstallRoot\$($entry.PSChildName)" -Description "Edge/WebView2 uninstall registration ($displayName)"
                     }
                 }
             }
+        }
 
-            # Remove per-user Edge, EdgeUpdate and WebView2 registrations. The documented
-            # WebView2 client GUID is F301...; removing the whole EdgeUpdate tree covers it
-            # and all other updater client registrations, as requested.
-            foreach ($hiveName in $cleanupHiveNames | Where-Object { $_ -match '^HKLM\\zCLEAN_(DEFAULT|USER\d+)$' }) {
-                foreach ($key in @(
-                    "$hiveName\Software\Microsoft\Edge",
-                    "$hiveName\Software\Microsoft\EdgeUpdate",
-                    "$hiveName\Software\WOW6432Node\Microsoft\Edge",
-                    "$hiveName\Software\WOW6432Node\Microsoft\EdgeUpdate",
-                    "$hiveName\Software\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge",
-                    "$hiveName\Software\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime",
-                    "$hiveName\Software\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
-                    "$hiveName\Software\Microsoft\Windows\CurrentVersion\App Paths\msedgewebview2.exe",
-                    "$hiveName\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
-                    "$hiveName\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedgewebview2.exe",
-                    "$hiveName\Software\Classes\microsoft-edge",
-                    "$hiveName\Software\Classes\MSEdgeHTM",
-                    "$hiveName\Software\Classes\msedge"
-                )) {
-                    Remove-RegistryKeyIfExists -RegistryPath $key -Description 'Microsoft Edge / EdgeUpdate / WebView2 per-user registration'
-                }
-                Remove-RegistryValueIfExists -RegistryPath "$hiveName\Software\RegisteredApplications" -ValueName 'Microsoft Edge' -Description 'Microsoft Edge per-user RegisteredApplications entry'
-            }
-
-            # Verify the critical machine-wide registrations are gone before unloading.
-            foreach ($verifyKey in @(
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Edge',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\EdgeUpdate',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate',
-                'HKLM\zCLEAN_SOFTWARE\Policies\Microsoft\EdgeUpdate',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime'
+        foreach ($hiveName in $cleanupHiveNames | Where-Object { $_ -match '^HKLM\\zCLEAN_(DEFAULT|USER\d+)$' }) {
+            foreach ($key in @(
+                "$hiveName\Software\Microsoft\Edge",
+                "$hiveName\Software\Microsoft\EdgeUpdate",
+                "$hiveName\Software\WOW6432Node\Microsoft\Edge",
+                "$hiveName\Software\WOW6432Node\Microsoft\EdgeUpdate",
+                "$hiveName\Software\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge",
+                "$hiveName\Software\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime",
+                "$hiveName\Software\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
+                "$hiveName\Software\Microsoft\Windows\CurrentVersion\App Paths\msedgewebview2.exe",
+                "$hiveName\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
+                "$hiveName\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedgewebview2.exe",
+                "$hiveName\Software\Classes\microsoft-edge",
+                "$hiveName\Software\Classes\MSEdgeHTM",
+                "$hiveName\Software\Classes\msedge"
             )) {
-                $verifyResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('query', $verifyKey)
-                if ($verifyResult.ExitCode -eq 0) { throw "Residual Edge/EdgeUpdate/WebView2 registry key remains after cleanup: $verifyKey" }
+                Remove-RegistryKeyIfExists -RegistryPath $key -Description 'Microsoft Edge / EdgeUpdate / WebView2 per-user registration'
             }
+            Remove-RegistryValueIfExists -RegistryPath "$hiveName\Software\RegisteredApplications" -ValueName 'Microsoft Edge' -Description 'Microsoft Edge per-user RegisteredApplications entry'
+        }
 
-            foreach ($controlSet in $controlSets) {
-                foreach ($serviceName in @('edgeupdate','edgeupdatem','MicrosoftEdgeElevationService')) {
-                    $serviceKey = "Registry::HKLM\zCLEAN_SYSTEM\$($controlSet.PSChildName)\Services\$serviceName"
-                    if (Test-Path -LiteralPath $serviceKey) {
-                        throw "Residual Microsoft Edge service registration remains: $($controlSet.PSChildName)\$serviceName"
-                    }
+        foreach ($verifyKey in @(
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Edge',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\EdgeUpdate',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate',
+            'HKLM\zCLEAN_SOFTWARE\Policies\Microsoft\EdgeUpdate',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge WebView2 Runtime'
+        )) {
+            $verifyResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('query', $verifyKey)
+            if ($verifyResult.ExitCode -eq 0) { throw "Residual Edge/EdgeUpdate/WebView2 registry key remains after cleanup: $verifyKey" }
+        }
+
+        foreach ($controlSet in $controlSets) {
+            foreach ($serviceName in @('edgeupdate','edgeupdatem','MicrosoftEdgeElevationService')) {
+                $serviceKey = "Registry::HKLM\zCLEAN_SYSTEM\$($controlSet.PSChildName)\Services\$serviceName"
+                if (Test-Path -LiteralPath $serviceKey) {
+                    throw "Residual Microsoft Edge service registration remains: $($controlSet.PSChildName)\$serviceName"
                 }
             }
+        }
+        $remainingEdgeTaskCache = @()
+        try {
+            $remainingEdgeTaskCache = @(
+                Get-ChildItem `
+                    -LiteralPath 'Registry::HKLM\zCLEAN_SYSTEM\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree' `
+                    -Recurse -Force -ErrorAction Stop |
+                Where-Object { $_.PSChildName -match '(?i)EdgeUpdate|MicrosoftEdgeUpdateTask|MicrosoftEdgeElevation' }
+            )
+        }
+        catch [System.Management.Automation.ItemNotFoundException] {
             $remainingEdgeTaskCache = @()
-            try {
-                $remainingEdgeTaskCache = @(
-                    Get-ChildItem `
-                        -LiteralPath 'Registry::HKLM\zCLEAN_SYSTEM\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree' `
-                        -Recurse -Force -ErrorAction Stop |
-                    Where-Object { $_.PSChildName -match '(?i)EdgeUpdate|MicrosoftEdgeUpdateTask|MicrosoftEdgeElevation' }
-                )
-            }
-            catch [System.Management.Automation.ItemNotFoundException] {
-                # No TaskCache tree exists in this image; there is nothing to verify.
-                $remainingEdgeTaskCache = @()
-            }
-            if ($remainingEdgeTaskCache.Count -gt 0) {
-                Write-WarningMsg "Residual EdgeUpdate scheduled-task registrations remain in the offline image (the task binaries are gone, so they cannot execute): $($remainingEdgeTaskCache.PSChildName -join ', ')"
-            }
         }
+        if ($remainingEdgeTaskCache.Count -gt 0) {
+            Write-WarningMsg "Residual EdgeUpdate scheduled-task registrations remain in the offline image (the task binaries are gone, so they cannot execute): $($remainingEdgeTaskCache.PSChildName -join ', ')"
+        }
+    }
 
-        $remainingEdgeTaskFiles = @()
-        if (Test-Path -LiteralPath $taskFilesRoot) {
-            $remainingEdgeTaskFiles = @(Get-ChildItem -LiteralPath $taskFilesRoot -Recurse -File -Force -ErrorAction Stop | Where-Object {
-                $_.Name -match '(?i)^MicrosoftEdge(Update|Elevation|WebView).*|^MicrosoftEdgeUpdateTask' -or
-                $_.FullName -match '(?i)\\EdgeUpdate(\\|$)'
-            })
-        }
-        if ($remainingEdgeTaskFiles.Count -gt 0) {
-            throw "Residual EdgeUpdate task files remain in the offline image: $($remainingEdgeTaskFiles.FullName -join ', ')"
-        }
+    $remainingEdgeTaskFiles = @()
+    if (Test-Path -LiteralPath $taskFilesRoot) {
+        $remainingEdgeTaskFiles = @(Get-ChildItem -LiteralPath $taskFilesRoot -Recurse -File -Force -ErrorAction Stop | Where-Object {
+            $_.Name -match '(?i)^MicrosoftEdge(Update|Elevation|WebView).*|^MicrosoftEdgeUpdateTask' -or
+            $_.FullName -match '(?i)\\EdgeUpdate(\\|$)'
+        })
+    }
+    if ($remainingEdgeTaskFiles.Count -gt 0) {
+        throw "Residual EdgeUpdate task files remain in the offline image: $($remainingEdgeTaskFiles.FullName -join ', ')"
+    }
 
-        # Remove Edge/WebView2 updater state and user-profile payloads from every offline profile.
-        $profilesRoot = Join-Path $MOUNT_DIR 'Users'
-        if (Test-Path -LiteralPath $profilesRoot) {
-            foreach ($profile in @(Get-ChildItem -LiteralPath $profilesRoot -Directory -Force -ErrorAction Stop)) {
-                if ($profile.Name -ieq 'Public' -or $profile.Name -ieq 'All Users') { continue }
-                foreach ($relativePath in @(
-                    'AppData\Local\Microsoft\Edge',
-                    'AppData\Local\Microsoft\EdgeUpdate',
-                    'AppData\Local\Microsoft\EdgeWebView',
-                    'AppData\Roaming\Microsoft\Edge',
-                    'AppData\Roaming\Microsoft\EdgeUpdate',
-                    'AppData\Roaming\Microsoft\EdgeWebView'
-                )) {
-                    $profilePath = Join-Path $profile.FullName $relativePath
-                    if (Test-Path -LiteralPath $profilePath) {
-                        if (-not (Invoke-TakeOwnership -Path $profilePath -Recurse)) {
-                            throw "Failed to take ownership of Edge/WebView2 profile data '$profilePath'."
-                        }
-                        if (-not (Remove-PathSafe -Path $profilePath)) {
-                            throw "Failed to remove Edge/WebView2 profile data '$profilePath'."
-                        }
+    $profilesRoot = Join-Path $MOUNT_DIR 'Users'
+    if (Test-Path -LiteralPath $profilesRoot) {
+        foreach ($profile in @(Get-ChildItem -LiteralPath $profilesRoot -Directory -Force -ErrorAction Stop)) {
+            if ($profile.Name -ieq 'Public' -or $profile.Name -ieq 'All Users') { continue }
+            foreach ($relativePath in @(
+                'AppData\Local\Microsoft\Edge',
+                'AppData\Local\Microsoft\EdgeUpdate',
+                'AppData\Local\Microsoft\EdgeWebView',
+                'AppData\Roaming\Microsoft\Edge',
+                'AppData\Roaming\Microsoft\EdgeUpdate',
+                'AppData\Roaming\Microsoft\EdgeWebView'
+            )) {
+                $profilePath = Join-Path $profile.FullName $relativePath
+                if (Test-Path -LiteralPath $profilePath) {
+                    if (-not (Invoke-TakeOwnership -Path $profilePath -Recurse)) {
+                        throw "Failed to take ownership of Edge/WebView2 profile data '$profilePath'."
+                    }
+                    if (-not (Remove-PathSafe -Path $profilePath)) {
+                        throw "Failed to remove Edge/WebView2 profile data '$profilePath'."
                     }
                 }
             }
         }
+    }
 
-        # Remove any provisioned Edge package that may exist on the source build.
-        $edgeProvisionedPrefixes = @(
-            'Microsoft.MicrosoftEdge',
-            'Microsoft.EdgeWebView2',
-            'Microsoft.MicrosoftEdgeDevToolsClient'
-        )
-        $edgeProvisionedResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
-            '/English', "/image:$MOUNT_DIR", '/Get-ProvisionedAppxPackages'
-        )
-        if ($edgeProvisionedResult.ExitCode -ne 0) {
-            throw "Failed to enumerate provisioned packages for Edge/WebView2 removal (DISM exit code $($edgeProvisionedResult.ExitCode))."
+    $edgeProvisionedPrefixes = @(
+        'Microsoft.MicrosoftEdge',
+        'Microsoft.EdgeWebView2',
+        'Microsoft.MicrosoftEdgeDevToolsClient'
+    )
+    $edgeProvisionedResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+        '/English', "/image:$MOUNT_DIR", '/Get-ProvisionedAppxPackages'
+    )
+    if ($edgeProvisionedResult.ExitCode -ne 0) {
+        throw "Failed to enumerate provisioned packages for Edge/WebView2 removal (DISM exit code $($edgeProvisionedResult.ExitCode))."
+    }
+    $edgeProvisionedPackages = @($edgeProvisionedResult.Output | ForEach-Object {
+        if ($_ -match 'PackageName\s*:\s*(.*)') { $matches[1].Trim() }
+    } | Where-Object {
+        $pkg = $_
+        foreach ($prefix in $edgeProvisionedPrefixes) {
+            if ($pkg -like "$prefix*") { return $true }
         }
-        $edgeProvisionedPackages = @($edgeProvisionedResult.Output | ForEach-Object {
-            if ($_ -match 'PackageName\s*:\s*(.*)') { $matches[1].Trim() }
-        } | Where-Object {
-            $pkg = $_
-            foreach ($prefix in $edgeProvisionedPrefixes) {
-                if ($pkg -like "$prefix*") { return $true }
-            }
-            return $false
-        })
-        foreach ($package in $edgeProvisionedPackages) {
-            $edgeRemoveResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
-                '/English', "/image:$MOUNT_DIR",
-                '/Remove-ProvisionedAppxPackage', "/PackageName:$package"
-            )
-            if ($edgeRemoveResult.ExitCode -ne 0) {
-                throw "Failed to remove provisioned Edge/WebView2 package '$package' (DISM exit code $($edgeRemoveResult.ExitCode))."
-            }
-        }
-        $edgeProvisionedVerify = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
-            '/English', "/image:$MOUNT_DIR", '/Get-ProvisionedAppxPackages'
+        return $false
+    })
+    foreach ($package in $edgeProvisionedPackages) {
+        $edgeRemoveResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+            '/English', "/image:$MOUNT_DIR",
+            '/Remove-ProvisionedAppxPackage', "/PackageName:$package"
         )
-        if ($edgeProvisionedVerify.ExitCode -ne 0) { throw "Failed to verify Edge/WebView2 provisioned package removal." }
-        $remainingEdgePackages = @($edgeProvisionedVerify.Output | ForEach-Object {
-            if ($_ -match 'PackageName\s*:\s*(.*)') { $matches[1].Trim() }
-        } | Where-Object {
-            $pkg = $_
-            foreach ($prefix in $edgeProvisionedPrefixes) {
-                if ($pkg -like "$prefix*") { return $true }
-            }
-            return $false
-        })
-        if ($remainingEdgePackages.Count -gt 0) {
-            throw "Edge/WebView2 provisioned packages remain after removal: $($remainingEdgePackages -join ', ')"
+        if ($edgeRemoveResult.ExitCode -ne 0) {
+            throw "Failed to remove provisioned Edge/WebView2 package '$package' (DISM exit code $($edgeRemoveResult.ExitCode))."
         }
+    }
+    $edgeProvisionedVerify = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+        '/English', "/image:$MOUNT_DIR", '/Get-ProvisionedAppxPackages'
+    )
+    if ($edgeProvisionedVerify.ExitCode -ne 0) { throw "Failed to verify Edge/WebView2 provisioned package removal." }
+    $remainingEdgePackages = @($edgeProvisionedVerify.Output | ForEach-Object {
+        if ($_ -match 'PackageName\s*:\s*(.*)') { $matches[1].Trim() }
+    } | Where-Object {
+        $pkg = $_
+        foreach ($prefix in $edgeProvisionedPrefixes) {
+            if ($pkg -like "$prefix*") { return $true }
+        }
+        return $false
+    })
+    if ($remainingEdgePackages.Count -gt 0) {
+        throw "Edge/WebView2 provisioned packages remain after removal: $($remainingEdgePackages -join ', ')"
+    }
 
-        $remainingEdgeComponents = @(
-            "$MOUNT_DIR\Program Files (x86)\Microsoft\Edge",
-            "$MOUNT_DIR\Program Files\Microsoft\Edge",
-            "$MOUNT_DIR\Program Files (x86)\Microsoft\EdgeWebView",
-            "$MOUNT_DIR\Program Files\Microsoft\EdgeWebView",
-            "$MOUNT_DIR\Program Files (x86)\Microsoft\EdgeUpdate",
-            "$MOUNT_DIR\Program Files\Microsoft\EdgeUpdate",
-            "$MOUNT_DIR\ProgramData\Microsoft\EdgeUpdate",
-            "$MOUNT_DIR\ProgramData\Microsoft\EdgeWebView"
-        ) | Where-Object { Test-Path -LiteralPath $_ }
-        if ($remainingEdgeComponents.Count -gt 0) {
-            throw "Edge/EdgeUpdate/WebView2 removal did not complete; remaining component paths: $($remainingEdgeComponents -join ', ')"
-        }
+    $remainingEdgeComponents = @(
+        "$MOUNT_DIR\Program Files (x86)\Microsoft\Edge",
+        "$MOUNT_DIR\Program Files\Microsoft\Edge",
+        "$MOUNT_DIR\Program Files (x86)\Microsoft\EdgeWebView",
+        "$MOUNT_DIR\Program Files\Microsoft\EdgeWebView",
+        "$MOUNT_DIR\Program Files (x86)\Microsoft\EdgeUpdate",
+        "$MOUNT_DIR\Program Files\Microsoft\EdgeUpdate",
+        "$MOUNT_DIR\ProgramData\Microsoft\EdgeUpdate",
+        "$MOUNT_DIR\ProgramData\Microsoft\EdgeWebView"
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+    if ($remainingEdgeComponents.Count -gt 0) {
+        throw "Edge/EdgeUpdate/WebView2 removal did not complete; remaining component paths: $($remainingEdgeComponents -join ', ')"
+    }
 
-        Write-Ok "Microsoft Edge, EdgeUpdate, and removable Evergreen WebView2 components were removed. OS-owned System32 WebView2 files were left untouched."
-        $mainProgress.CompleteStep()
+    Write-Ok "Microsoft Edge, EdgeUpdate, and removable Evergreen WebView2 components were removed. OS-owned System32 WebView2 files were left untouched."
+    $mainProgress.CompleteStep()
 
     # ==================== REMOVE ONEDRIVE ====================
-    
-        $mainProgress.StartStep("Removing OneDrive")
-        Write-Step "Removing OneDrive and its registry/shell integration..."
+    $mainProgress.StartStep("Removing OneDrive")
+    Write-Step "Removing OneDrive and its registry/shell integration..."
 
-        $oneDrivePaths = @(
-            "$MOUNT_DIR\Windows\System32\OneDriveSetup.exe",
-            "$MOUNT_DIR\SysWOW64\OneDriveSetup.exe",
-            "$MOUNT_DIR\Program Files\Microsoft OneDrive",
-            "$MOUNT_DIR\Program Files (x86)\Microsoft OneDrive"
+    $oneDrivePaths = @(
+        "$MOUNT_DIR\Windows\System32\OneDriveSetup.exe",
+        "$MOUNT_DIR\SysWOW64\OneDriveSetup.exe",
+        "$MOUNT_DIR\Program Files\Microsoft OneDrive",
+        "$MOUNT_DIR\Program Files (x86)\Microsoft OneDrive"
+    )
+    foreach ($oneDrivePath in $oneDrivePaths) {
+        if (Test-Path -LiteralPath $oneDrivePath) {
+            if (-not (Invoke-TakeOwnership -Path $oneDrivePath -Recurse)) {
+                throw "Failed to take ownership of OneDrive payload '$oneDrivePath'."
+            }
+            if (-not (Remove-PathSafe -Path $oneDrivePath)) {
+                throw "Failed to remove OneDrive payload '$oneDrivePath'."
+            }
+        }
+    }
+
+    foreach ($pattern in @(
+        "$MOUNT_DIR\Users\*\AppData\Local\Microsoft\OneDrive",
+        "$MOUNT_DIR\Users\Default\AppData\Roaming\Microsoft\OneDrive"
+    )) {
+        foreach ($item in @(Get-Item -Path $pattern -Force -ErrorAction SilentlyContinue)) {
+            if (-not (Invoke-TakeOwnership -Path $item.FullName -Recurse)) {
+                throw "Failed to take ownership of OneDrive client data '$($item.FullName)'."
+            }
+            if (-not (Remove-PathSafe -Path $item.FullName)) {
+                throw "Failed to remove OneDrive client data '$($item.FullName)'."
+            }
+        }
+    }
+
+    foreach ($taskRoot in @(
+        "$MOUNT_DIR\Windows\System32\Tasks\Microsoft\Windows\OneDrive",
+        "$MOUNT_DIR\Windows\System32\Tasks\OneDrive"
+    )) {
+        if (Test-Path -LiteralPath $taskRoot) {
+            if (-not (Invoke-TakeOwnership -Path $taskRoot -Recurse)) {
+                throw "Failed to take ownership of OneDrive scheduled-task directory '$taskRoot'."
+            }
+            if (-not (Remove-PathSafe -Path $taskRoot)) {
+                throw "Failed to remove OneDrive scheduled-task directory '$taskRoot'."
+            }
+        }
+    }
+    foreach ($shortcutRoot in @(
+        "$MOUNT_DIR\ProgramData\Microsoft\Windows\Start Menu\Programs",
+        "$MOUNT_DIR\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
+    )) {
+        foreach ($shortcut in @(Get-ChildItem -LiteralPath $shortcutRoot -Filter '*OneDrive*.lnk' -File -Force -ErrorAction SilentlyContinue)) {
+            if (-not (Remove-PathSafe -Path $shortcut.FullName -Silent)) {
+                throw "Could not remove OneDrive shortcut '$($shortcut.FullName)'."
+            }
+        }
+    }
+
+    Invoke-OfflineRegistryCleanup -Action {
+        param($cleanupHiveNames)
+
+        Remove-OfflineScheduledTaskTree -SystemHive 'HKLM\zCLEAN_SYSTEM' -TaskTreePath 'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\OneDrive'
+        Remove-OfflineScheduledTaskTree -SystemHive 'HKLM\zCLEAN_SYSTEM' -TaskTreePath 'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\OneDrive'
+
+        $oneDriveRegistryKeys = @(
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\OneDrive',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\OneDrive',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive',
+            'HKLM\zCLEAN_SOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+            'HKLM\zCLEAN_SOFTWARE\Classes\WOW6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
         )
-        foreach ($oneDrivePath in $oneDrivePaths) {
-            if (Test-Path -LiteralPath $oneDrivePath) {
-                if (-not (Invoke-TakeOwnership -Path $oneDrivePath -Recurse)) {
-                    throw "Failed to take ownership of OneDrive payload '$oneDrivePath'."
-                }
-                if (-not (Remove-PathSafe -Path $oneDrivePath)) {
-                    throw "Failed to remove OneDrive payload '$oneDrivePath'."
-                }
-            }
+        foreach ($key in $oneDriveRegistryKeys) {
+            Remove-RegistryKeyIfExists -RegistryPath $key -Description 'OneDrive'
         }
 
-        # Remove client state, but never delete Users\*\OneDrive folders: those are
-        # user data, not application components.
-        foreach ($pattern in @(
-            "$MOUNT_DIR\Users\*\AppData\Local\Microsoft\OneDrive",
-            "$MOUNT_DIR\Users\Default\AppData\Roaming\Microsoft\OneDrive"
+        foreach ($overlayRoot in @(
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'
         )) {
-            foreach ($item in @(Get-Item -Path $pattern -Force -ErrorAction SilentlyContinue)) {
-                if (-not (Invoke-TakeOwnership -Path $item.FullName -Recurse)) {
-                    throw "Failed to take ownership of OneDrive client data '$($item.FullName)'."
+            $providerOverlayRoot = "Registry::$overlayRoot"
+            if (Test-Path -LiteralPath $providerOverlayRoot) {
+                foreach ($overlay in @(Get-ChildItem -LiteralPath $providerOverlayRoot -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '(?i)OneDrive' })) {
+                    Remove-RegistryKeyIfExists -RegistryPath "$overlayRoot\$($overlay.PSChildName)" -Description 'OneDrive shell overlay registration'
                 }
-                if (-not (Remove-PathSafe -Path $item.FullName)) {
-                    throw "Failed to remove OneDrive client data '$($item.FullName)'."
+            }
+        }
+        Remove-RegistryValueIfExists -RegistryPath 'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -ValueName 'OneDrive' -Description 'OneDrive system startup entry'
+
+        foreach ($hiveName in $cleanupHiveNames | Where-Object { $_ -match '^HKLM\\zCLEAN_(DEFAULT|USER\d+)$' }) {
+            Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\OneDrive" -Description 'OneDrive user state'
+            Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe" -Description 'OneDrive user uninstall registration'
+            Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive" -Description 'OneDrive user uninstall registration'
+            Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" -Description 'OneDrive user shell integration'
+            Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Classes\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" -Description 'OneDrive user shell integration'
+            Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" -Description 'OneDrive user namespace integration'
+            Remove-RegistryValueIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Run" -ValueName 'OneDrive' -Description 'OneDrive user startup entry'
+            Remove-RegistryValueIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Run" -ValueName 'OneDriveSetup' -Description 'OneDrive user startup entry'
+            $userOverlayRoot = "Registry::$hiveName\Software\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers"
+            if (Test-Path -LiteralPath $userOverlayRoot) {
+                foreach ($overlay in @(Get-ChildItem -LiteralPath $userOverlayRoot -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '(?i)OneDrive' })) {
+                    Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\$($overlay.PSChildName)" -Description 'OneDrive user shell overlay registration'
                 }
             }
         }
 
-        # Remove OneDrive scheduled-update tasks and shortcuts, but never touch
-        # user OneDrive data folders.
-        foreach ($taskRoot in @(
-            "$MOUNT_DIR\Windows\System32\Tasks\Microsoft\Windows\OneDrive",
-            "$MOUNT_DIR\Windows\System32\Tasks\OneDrive"
+        foreach ($verifyKey in @(
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\OneDrive',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\OneDrive',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe',
+            'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive',
+            'HKLM\zCLEAN_SOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+            'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
         )) {
-            if (Test-Path -LiteralPath $taskRoot) {
-                if (-not (Invoke-TakeOwnership -Path $taskRoot -Recurse)) {
-                    throw "Failed to take ownership of OneDrive scheduled-task directory '$taskRoot'."
-                }
-                if (-not (Remove-PathSafe -Path $taskRoot)) {
-                    throw "Failed to remove OneDrive scheduled-task directory '$taskRoot'."
-                }
-            }
+            $verifyResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('query', $verifyKey)
+            if ($verifyResult.ExitCode -eq 0) { throw "Residual OneDrive registry key remains after cleanup: $verifyKey" }
         }
-        foreach ($shortcutRoot in @(
-            "$MOUNT_DIR\ProgramData\Microsoft\Windows\Start Menu\Programs",
-            "$MOUNT_DIR\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
-        )) {
-            foreach ($shortcut in @(Get-ChildItem -LiteralPath $shortcutRoot -Filter '*OneDrive*.lnk' -File -Force -ErrorAction SilentlyContinue)) {
-                if (-not (Remove-PathSafe -Path $shortcut.FullName -Silent)) {
-                    throw "Could not remove OneDrive shortcut '$($shortcut.FullName)'."
-                }
-            }
-        }
+    }
 
-        Invoke-OfflineRegistryCleanup -Action {
-            param($cleanupHiveNames)
+    $remainingOneDrive = @(
+        "$MOUNT_DIR\Windows\System32\OneDriveSetup.exe",
+        "$MOUNT_DIR\SysWOW64\OneDriveSetup.exe",
+        "$MOUNT_DIR\Program Files\Microsoft OneDrive",
+        "$MOUNT_DIR\Program Files (x86)\Microsoft OneDrive"
+    ) | Where-Object { Test-Path -LiteralPath $_ }
 
-            Remove-OfflineScheduledTaskTree -SystemHive 'HKLM\zCLEAN_SYSTEM' -TaskTreePath 'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\OneDrive'
-            Remove-OfflineScheduledTaskTree -SystemHive 'HKLM\zCLEAN_SYSTEM' -TaskTreePath 'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\OneDrive'
-
-            $oneDriveRegistryKeys = @(
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\OneDrive',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\OneDrive',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive',
-                'HKLM\zCLEAN_SOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
-                'HKLM\zCLEAN_SOFTWARE\Classes\WOW6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
-            )
-            foreach ($key in $oneDriveRegistryKeys) {
-                Remove-RegistryKeyIfExists -RegistryPath $key -Description 'OneDrive'
-            }
-
-            foreach ($overlayRoot in @(
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'
-            )) {
-                $providerOverlayRoot = "Registry::$overlayRoot"
-                if (Test-Path -LiteralPath $providerOverlayRoot) {
-                    foreach ($overlay in @(Get-ChildItem -LiteralPath $providerOverlayRoot -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '(?i)OneDrive' })) {
-                        Remove-RegistryKeyIfExists -RegistryPath "$overlayRoot\$($overlay.PSChildName)" -Description 'OneDrive shell overlay registration'
-                    }
-                }
-            }
-            Remove-RegistryValueIfExists -RegistryPath 'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -ValueName 'OneDrive' -Description 'OneDrive system startup entry'
-
-            foreach ($hiveName in $cleanupHiveNames | Where-Object { $_ -match '^HKLM\\zCLEAN_(DEFAULT|USER\d+)$' }) {
-                Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\OneDrive" -Description 'OneDrive user state'
-                Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe" -Description 'OneDrive user uninstall registration'
-                Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive" -Description 'OneDrive user uninstall registration'
-                Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" -Description 'OneDrive user shell integration'
-                Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Classes\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" -Description 'OneDrive user shell integration'
-                Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" -Description 'OneDrive user namespace integration'
-                Remove-RegistryValueIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Run" -ValueName 'OneDrive' -Description 'OneDrive user startup entry'
-                Remove-RegistryValueIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Run" -ValueName 'OneDriveSetup' -Description 'OneDrive user startup entry'
-                $userOverlayRoot = "Registry::$hiveName\Software\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers"
-                if (Test-Path -LiteralPath $userOverlayRoot) {
-                    foreach ($overlay in @(Get-ChildItem -LiteralPath $userOverlayRoot -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '(?i)OneDrive' })) {
-                        Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\$($overlay.PSChildName)" -Description 'OneDrive user shell overlay registration'
-                    }
-                }
-            }
-
-            foreach ($verifyKey in @(
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\OneDrive',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\OneDrive',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe',
-                'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft OneDrive',
-                'HKLM\zCLEAN_SOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
-                'HKLM\zCLEAN_SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
-            )) {
-                $verifyResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('query', $verifyKey)
-                if ($verifyResult.ExitCode -eq 0) { throw "Residual OneDrive registry key remains after cleanup: $verifyKey" }
-            }
-        }
-
-        $remainingOneDrive = @(
-            "$MOUNT_DIR\Windows\System32\OneDriveSetup.exe",
-            "$MOUNT_DIR\SysWOW64\OneDriveSetup.exe",
-            "$MOUNT_DIR\Program Files\Microsoft OneDrive",
-            "$MOUNT_DIR\Program Files (x86)\Microsoft OneDrive"
-        ) | Where-Object { Test-Path -LiteralPath $_ }
-
-        if ($remainingOneDrive.Count -gt 0) {
-            # OneDriveSetup.exe is a TrustedInstaller-owned servicing component. Its
-            # file handle is held by DISM's offline servicing session while the WIM is
-            # mounted, so it cannot be removed from here even after takeown/icacls.
-            # This is expected and harmless: the scheduled task, the startup entry,
-            # the shell integration and every registry path that could launch it are
-            # gone. Schedule the file for deletion by SetupComplete.cmd on first boot,
-            # which runs as SYSTEM after the image is installed and no servicing lock
-            # is present.
-            Write-WarningMsg "These OneDrive payloads could not be removed offline (protected by the servicing stack); they will be removed on first boot: $($remainingOneDrive -join ', ')"
-        }
-        Write-Ok "OneDrive client, shell integration, startup entries, and uninstall registrations removed (user OneDrive folders preserved)."
-        $mainProgress.CompleteStep()
-    
+    if ($remainingOneDrive.Count -gt 0) {
+        Write-WarningMsg "These OneDrive payloads could not be removed offline (protected by the servicing stack); they will be removed on first boot: $($remainingOneDrive -join ', ')"
+    }
+    Write-Ok "OneDrive client, shell integration, startup entries, and uninstall registrations removed (user OneDrive folders preserved)."
+    $mainProgress.CompleteStep()
 
     # ==================== REGISTRY TWEAKS ====================
-    # autounattend.xml is intentionally placed on the ISO root below. Do not also
-    # copy it into %WINDIR%\System32\Sysprep: that location is intended for
-    # Unattend.xml and later Sysprep/configuration phases.
-
     if (-not $SkipRegistryTweaks) {
         $mainProgress.StartStep("Applying registry tweaks")
         Write-Step "Loading registry hives..."
@@ -2456,11 +2204,7 @@ $index = $null
             'HKLM\zSYSTEM'     = (Join-Path $MOUNT_DIR "Windows\System32\config\SYSTEM")
         }
 
-        # These aliases are owned by this build process and are about to be
-		# loaded by Invoke-RegistryHiveOperations. Do not blindly call
-		# "reg.exe unload" here: reg.exe returns "The parameter is incorrect"
-		# when the alias is not currently loaded.
-		Write-Step "Preparing offline registry hive aliases..."
+        Write-Step "Preparing offline registry hive aliases..."
         $loadedHives = Invoke-RegistryHiveOperations -Operation Load -Hives $hives
         if ($loadedHives.Count -ne $hives.Count) {
             $expected = @($hives.Keys)
@@ -2505,32 +2249,24 @@ $index = $null
             'HKLM\zSOFTWARE\Policies\Microsoft\MRT'           = @{ 'DontOfferThroughWUAU' = 1 }
         }
 
-		foreach ($deleteKey in @(
-			'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\Subscriptions',
-			'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SuggestedApps'
-		)) {
-			# These are optional cleanup keys. They may not exist in this Windows
-			# image, so check first rather than invoking reg.exe against a missing key.
-			$providerKey = "Registry::$deleteKey"
-
-			if (Test-Path -LiteralPath $providerKey) {
-				$deleteResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('delete', $deleteKey, '/f')
-
-				if ($deleteResult.ExitCode -ne 0) {
-					throw "Failed to delete optional registry key $deleteKey (reg.exe exit code $($deleteResult.ExitCode)): $($deleteResult.Output -join ' ')"
-				}
-
-				Write-Ok "Deleted optional registry key: $deleteKey"
-			}
-			else {
-				Write-Step "Optional registry key not present: $deleteKey"
-			}
-		}
+        foreach ($deleteKey in @(
+            'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\Subscriptions',
+            'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SuggestedApps'
+        )) {
+            $providerKey = "Registry::$deleteKey"
+            if (Test-Path -LiteralPath $providerKey) {
+                $deleteResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('delete', $deleteKey, '/f')
+                if ($deleteResult.ExitCode -ne 0) {
+                    throw "Failed to delete optional registry key $deleteKey (reg.exe exit code $($deleteResult.ExitCode)): $($deleteResult.Output -join ' ')"
+                }
+                Write-Ok "Deleted optional registry key: $deleteKey"
+            }
+            else {
+                Write-Step "Optional registry key not present: $deleteKey"
+            }
+        }
 
         # --- Local account / OOBE ---
-        # OOBE behavior is controlled by the validated autounattend.xml on the ISO.
-        # Do not write BypassNRO here: newer Windows builds may ignore that registry
-        # value, so treating it as a required mechanism makes the image unreliable.
         Write-Step "Using validated autounattend.xml for offline/local-account OOBE..."
 
         # --- BitLocker ---
@@ -2547,7 +2283,6 @@ $index = $null
         Set-RegistryValue -HivePath 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\OneDrive' -Values @{ 'DisableFileSyncNGSC' = 1 }
 
         # --- Telemetry ---
-        # Telemetry removal is always enabled; there is intentionally no skip switch.
         Write-Step "Disabling telemetry..."
         Set-RegistryValuesMap -Map @{
             'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo'        = @{ 'Enabled' = 0 }
@@ -2562,120 +2297,111 @@ $index = $null
         try {
             Set-RegistryValue -HivePath $telemetryServiceKey -Values @{ 'Start' = 4 } -RequireExistingKey
         } catch {
-            # Some Windows builds do not contain this legacy service. Never create
-            # a partial service registry tree just to apply the telemetry tweak.
             Write-WarningMsg "Skipping dmwappushservice registry tweak: $($_.Exception.Message)"
         }
 
         # --- Prevent DevHome & Outlook ---
-		# Scheduler flags alone do not remove provisioned packages. Remove targeted
-		# packages first, then apply compatibility scheduler guards.
-		Write-Step "Removing/preventing DevHome and New Outlook..."
+        Write-Step "Removing/preventing DevHome and New Outlook..."
 
-		$optionalProvisionedPrefixes = @(
-			'Microsoft.OutlookForWindows_',
-			'Microsoft.Windows.DevHome_',
-			'Microsoft.DevHome_'
-		)
+        $optionalProvisionedPrefixes = @(
+            'Microsoft.OutlookForWindows_',
+            'Microsoft.Windows.DevHome_',
+            'Microsoft.DevHome_'
+        )
 
-		# DISM can return exit code 32 when there are no provisioned packages
-		# matching/available for enumeration in the offline image. Capture the
-		# native output without allowing ErrorActionPreference=Stop to abort first.
-		$optionalResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
-			'/English', "/image:$MOUNT_DIR", '/Get-ProvisionedAppxPackages'
-		)
-		$optionalDismExitCode = $optionalResult.ExitCode
+        $optionalResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+            '/English', "/image:$MOUNT_DIR", '/Get-ProvisionedAppxPackages'
+        )
+        $optionalDismExitCode = $optionalResult.ExitCode
 
-		if ($optionalDismExitCode -ne 0 -and $optionalDismExitCode -ne 32) {
-			throw "Failed to enumerate provisioned packages for Outlook/DevHome removal (DISM exit code $optionalDismExitCode): $($optionalResult.Output -join ' ')"
-		}
+        if ($optionalDismExitCode -ne 0 -and $optionalDismExitCode -ne 32) {
+            throw "Failed to enumerate provisioned packages for Outlook/DevHome removal (DISM exit code $optionalDismExitCode): $($optionalResult.Output -join ' ')"
+        }
 
-		$optionalPackages = @(
-			$optionalResult.Output |
-				ForEach-Object {
-					if ($_ -match 'PackageName\s*:\s*(.*)') {
-						$matches[1].Trim()
-					}
-				} |
-				Where-Object {
-					$pkg = $_
-					foreach ($prefix in $optionalProvisionedPrefixes) {
-						if ($pkg -like "$prefix*") {
-							return $true
-						}
-					}
-					return $false
-				}
-		)
+        $optionalPackages = @(
+            $optionalResult.Output |
+                ForEach-Object {
+                    if ($_ -match 'PackageName\s*:\s*(.*)') {
+                        $matches[1].Trim()
+                    }
+                } |
+                Where-Object {
+                    $pkg = $_
+                    foreach ($prefix in $optionalProvisionedPrefixes) {
+                        if ($pkg -like "$prefix*") {
+                            return $true
+                        }
+                    }
+                    return $false
+                }
+        )
 
-		foreach ($package in $optionalPackages) {
-			$removeResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
-				'/English', "/image:$MOUNT_DIR",
-				'/Remove-ProvisionedAppxPackage', "/PackageName:$package"
-			)
+        foreach ($package in $optionalPackages) {
+            $removeResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+                '/English', "/image:$MOUNT_DIR",
+                '/Remove-ProvisionedAppxPackage', "/PackageName:$package"
+            )
 
-			if ($removeResult.ExitCode -ne 0) {
-				throw "Failed to remove provisioned Outlook/DevHome package '$package' (DISM exit code $($removeResult.ExitCode)): $($removeResult.Output -join ' ')"
-			}
+            if ($removeResult.ExitCode -ne 0) {
+                throw "Failed to remove provisioned Outlook/DevHome package '$package' (DISM exit code $($removeResult.ExitCode)): $($removeResult.Output -join ' ')"
+            }
 
-			Write-Ok "Removed provisioned package: $package"
-		}
+            Write-Ok "Removed provisioned package: $package"
+        }
 
-		if ($optionalPackages.Count -eq 0) {
-			Write-Step "No provisioned Outlook/DevHome packages found; continuing."
-		}
+        if ($optionalPackages.Count -eq 0) {
+            Write-Step "No provisioned Outlook/DevHome packages found; continuing."
+        }
 
-		Set-RegistryValue `
-			-HivePath 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' `
-			-Values @{ 'workCompleted' = 1 }
+        Set-RegistryValue `
+            -HivePath 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' `
+            -Values @{ 'workCompleted' = 1 }
 
-		Set-RegistryValue `
-			-HivePath 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' `
-			-Values @{ 'workCompleted' = 1 }
+        Set-RegistryValue `
+            -HivePath 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' `
+            -Values @{ 'workCompleted' = 1 }
 
-		foreach ($deleteKey in @(
-			'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate',
-			'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate'
-		)) {
-			$deleteResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('delete', $deleteKey, '/f')
+        foreach ($deleteKey in @(
+            'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate',
+            'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate'
+        )) {
+            $deleteResult = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('delete', $deleteKey, '/f')
 
-			if ($deleteResult.ExitCode -ne 0 -and $deleteResult.ExitCode -ne 1) {
-				throw "Failed to delete optional update scheduler key $deleteKey (reg.exe exit code $($deleteResult.ExitCode))"
-			}
-		}
+            if ($deleteResult.ExitCode -ne 0 -and $deleteResult.ExitCode -ne 1) {
+                throw "Failed to delete optional update scheduler key $deleteKey (reg.exe exit code $($deleteResult.ExitCode))"
+            }
+        }
 
-		# Verify. Exit code 32 is treated the same way as the initial enumeration:
-		# there is nothing provisioned to verify.
-		$verifyOptionalResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
-			'/English', "/image:$MOUNT_DIR", '/Get-ProvisionedAppxPackages'
-		)
-		$verifyOptionalExitCode = $verifyOptionalResult.ExitCode
+        $verifyOptionalResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+            '/English', "/image:$MOUNT_DIR", '/Get-ProvisionedAppxPackages'
+        )
+        $verifyOptionalExitCode = $verifyOptionalResult.ExitCode
 
-		if ($verifyOptionalExitCode -ne 0 -and $verifyOptionalExitCode -ne 32) {
-			throw "Failed to verify Outlook/DevHome package removal (DISM exit code $verifyOptionalExitCode)."
-		}
+        if ($verifyOptionalExitCode -ne 0 -and $verifyOptionalExitCode -ne 32) {
+            throw "Failed to verify Outlook/DevHome package removal (DISM exit code $verifyOptionalExitCode)."
+        }
 
-		$remainingOptional = @(
-			$verifyOptionalResult.Output |
-				ForEach-Object {
-					if ($_ -match 'PackageName\s*:\s*(.*)') {
-						$matches[1].Trim()
-					}
-				} |
-				Where-Object {
-					$pkg = $_
-					foreach ($prefix in $optionalProvisionedPrefixes) {
-						if ($pkg -like "$prefix*") {
-							return $true
-						}
-					}
-					return $false
-				}
-		)
+        $remainingOptional = @(
+            $verifyOptionalResult.Output |
+                ForEach-Object {
+                    if ($_ -match 'PackageName\s*:\s*(.*)') {
+                        $matches[1].Trim()
+                    }
+                } |
+                Where-Object {
+                    $pkg = $_
+                    foreach ($prefix in $optionalProvisionedPrefixes) {
+                        if ($pkg -like "$prefix*") {
+                            return $true
+                        }
+                    }
+                    return $false
+                }
+        )
 
-		if ($remainingOptional.Count -gt 0) {
-			throw "Outlook/DevHome provisioned packages remain after removal: $($remainingOptional -join ', ')"
-		}
+        if ($remainingOptional.Count -gt 0) {
+            throw "Outlook/DevHome provisioned packages remain after removal: $($remainingOptional -join ', ')"
+        }
 
         # --- Copilot ---
         Write-Step "Disabling Copilot..."
@@ -2690,67 +2416,77 @@ $index = $null
         Write-Step "Disabling New Outlook..."
         Set-RegistryValue -HivePath 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Mail' -Values @{ 'PreventRun' = 1 }
 
-		# --- Delete scheduled tasks ---
-		Write-Step "Deleting telemetry scheduled tasks..."
+        # --- Delete telemetry scheduled tasks (files + registry) ---
+        Write-Step "Deleting telemetry scheduled tasks..."
 
-		$tasksToDelete = @(
-			(Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser"),
-			(Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Application Experience\ProgramDataUpdater"),
-			(Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Customer Experience Improvement Program"),
-			(Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Chkdsk\Proxy"),
-			(Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Windows Error Reporting\QueueReporting")
-		)
+        $tasksToDelete = @(
+            (Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser"),
+            (Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Application Experience\ProgramDataUpdater"),
+            (Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Customer Experience Improvement Program"),
+            (Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Chkdsk\Proxy"),
+            (Join-Path $MOUNT_DIR "Windows\System32\Tasks\Microsoft\Windows\Windows Error Reporting\QueueReporting")
+        )
 
-		foreach ($task in $tasksToDelete) {
-			if (Test-Path -LiteralPath $task) {
-				if (-not (Invoke-TakeOwnership -Path $task)) {
-					throw "Failed to take ownership of scheduled task file '$task'."
-				}
+        foreach ($task in $tasksToDelete) {
+            if (Test-Path -LiteralPath $task) {
+                if (-not (Invoke-TakeOwnership -Path $task)) {
+                    throw "Failed to take ownership of scheduled task file '$task'."
+                }
 
-				if (-not (Remove-PathSafe -Path $task -Silent)) {
-					throw "Could not remove scheduled task file '$task'."
-				}
-			}
-		}
+                if (-not (Remove-PathSafe -Path $task -Silent)) {
+                    throw "Could not remove scheduled task file '$task'."
+                }
+            }
+        }
 
-		# NOTE:
-		# The offline TaskCache registry cleanup is temporarily disabled while
-		# diagnosing an HKLM\zSYSTEM hive unload/handle issue. The task files
-		# themselves are still removed above.
-		#
-		# foreach ($taskTreePath in @(
-		#     'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser',
-		#     'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Application Experience\ProgramDataUpdater',
-		#     'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Customer Experience Improvement Program',
-		#     'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Chkdsk\Proxy',
-		#     'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Error Reporting\QueueReporting'
-		# )) {
-		#     Remove-OfflineScheduledTaskTree -SystemHive 'HKLM\zSYSTEM' -TaskTreePath $taskTreePath
-		# }
+        # Registry-side task-cache cleanup for the deleted telemetry tasks.
+        # Uses the robust Remove-OfflineScheduledTaskTree helper against the
+        # already-loaded HKLM\zSYSTEM hive. Paths must match the exact task-tree
+        # locations Microsoft uses under TaskCache\Tree.
+        Write-Step "Removing telemetry scheduled-task registry entries..."
+        $telemetryTaskTrees = @(
+            'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser',
+            'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Application Experience\ProgramDataUpdater',
+            'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Customer Experience Improvement Program\Consolidator',
+            'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Customer Experience Improvement Program\KernelCeipTask',
+            'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip',
+            'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Chkdsk\Proxy',
+            'Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Windows Error Reporting\QueueReporting'
+        )
+        foreach ($treePath in $telemetryTaskTrees) {
+            Remove-OfflineScheduledTaskTree -SystemHive 'HKLM\zSYSTEM' -TaskTreePath $treePath
+        }
 
-		# --- Unload hives ---
-		Write-Step "Unloading registry hives..."
+        # Also sweep by regex for the folder-style CEIP registrations that
+        # may be nested one level deeper.
+        Remove-OfflineScheduledTasksByName -SystemHive 'HKLM\zSYSTEM' -NameRegex @(
+            '(?i)^ProgramDataUpdater$',
+            '(?i)^Microsoft Compatibility Appraiser$',
+            '(?i)^QueueReporting$'
+        )
 
-		$unloadedHives = @(Invoke-RegistryHiveOperations -Operation Unload -Hives @($loadedHives))
+        # --- Unload hives ---
+        Write-Step "Unloading registry hives..."
 
-		if ($unloadedHives.Count -ne @($loadedHives).Count) {
-			$remainingHives = @(
-				@($loadedHives) | Where-Object {
-					$unloadedHives -notcontains $_
-				}
-			)
+        $unloadedHives = @(Invoke-RegistryHiveOperations -Operation Unload -Hives @($loadedHives))
 
-			$loadedHives = $remainingHives
+        if ($unloadedHives.Count -ne @($loadedHives).Count) {
+            $remainingHives = @(
+                @($loadedHives) | Where-Object {
+                    $unloadedHives -notcontains $_
+                }
+            )
 
-			throw "Failed to unload one or more main-image registry hives. Still loaded: $($remainingHives -join ', ')"
-		}
+            $loadedHives = $remainingHives
 
-		$loadedHives = @()
+            throw "Failed to unload one or more main-image registry hives. Still loaded: $($remainingHives -join ', ')"
+        }
 
-		$mainProgress.CompleteStep()
+        $loadedHives = @()
 
+        $mainProgress.CompleteStep()
     }
-	else {
+    else {
         $mainProgress.StartStep("Skipping registry tweaks")
         Write-WarningMsg "Skipping registry tweaks as requested."
         $mainProgress.CompleteStep()
@@ -2760,7 +2496,6 @@ $index = $null
     $mainProgress.StartStep("Exporting and compressing image")
 
     if (-not $SkipComponentCleanup) {
-        # /ResetBase is destructive; require explicit confirmation.
         $proceed = Test-Confirmation "Component cleanup with /ResetBase will prevent uninstalling Windows updates. Continue?"
         if ($proceed) {
             Write-Step "Cleaning up image components (this can take a long time)..."
@@ -2776,7 +2511,6 @@ $index = $null
     Invoke-WindowsImageDismountRobust -MountPath $MOUNT_DIR -Attempts 5 -InitialDelaySeconds 2
     $mainImageMounted = $false
 
-    # Give DISM a moment to close the WIM before the export stage opens it again.
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
     Start-Sleep -Seconds 5
@@ -2812,518 +2546,448 @@ $index = $null
     $mainProgress.CompleteStep()
 
     # ==================== CUSTOMIZE BOOT.WIM ====================
-	$mainProgress.StartStep("Customizing boot.wim")
-	Write-Banner "Customizing boot.wim" Magenta
-
-	if (-not (Test-Path -LiteralPath $BOOT_WIM_PATH)) {
-		Write-ErrorMessage "boot.wim not found at $BOOT_WIM_PATH"
-		throw "Missing boot.wim"
-	}
-
-	# Enumerate boot.wim images and identify the Windows Setup image.
-	$bootImages = @(Get-WindowsImage -ImagePath $BOOT_WIM_PATH -ErrorAction Stop)
-
-	if ($bootImages.Count -eq 0) {
-		throw "No images found in boot.wim."
-	}
-
-	$setupImage = $bootImages |
-		Where-Object {
-			$_.ImageName -match '(?i)Windows.*Setup|Microsoft.*Setup'
-		} |
-		Select-Object -First 1
-
-	if ($setupImage) {
-		$bootIndex = [int]$setupImage.ImageIndex
-	} elseif ($bootImages | Where-Object { $_.ImageIndex -eq 2 }) {
-		$bootIndex = 2
-	} else {
-		$bootIndex = [int]$bootImages[0].ImageIndex
-		Write-WarningMsg "Could not identify a Windows Setup image by name; falling back to boot.wim index $bootIndex."
-	}
-
-	Write-Step "Using boot.wim index $bootIndex"
-
-	# Prepare boot.wim for mounting.
-	if (-not (Invoke-TakeOwnership -Path $BOOT_WIM_PATH)) {
-		throw "Failed to prepare boot.wim for mounting: ownership/ACL update failed."
-	}
-
-	Set-ItemProperty `
-		-Path $BOOT_WIM_PATH `
-		-Name IsReadOnly `
-		-Value $false `
-		-ErrorAction Stop
-
-	Write-Step "Verifying DISM mount state before mounting boot.wim..."
-	$bootMountConflicts = @(Get-DismMountedImagesSafe | Where-Object {
-		($_.MountPath -and (Test-SameWindowsPath ([string]$_.MountPath) $MOUNT_DIR)) -or
-		($_.ImagePath -and (Test-SameWindowsPath ([string]$_.ImagePath) $BOOT_WIM_PATH))
-	})
-	if ($bootMountConflicts.Count -gt 0) {
-		$details = ($bootMountConflicts | ForEach-Object { "MountPath='$($_.MountPath)', ImagePath='$($_.ImagePath)'" }) -join '; '
-		throw "Refusing to mount boot.wim because DISM already reports a conflicting mount: $details"
-	}
-
-	Write-Step "Mounting boot.wim (Index $bootIndex)..."
-
-	Mount-WindowsImage `
-		-ImagePath $BOOT_WIM_PATH `
-		-Index $bootIndex `
-		-Path $MOUNT_DIR `
-		-CheckIntegrity `
-		-ErrorAction Stop
-
-	$bootImageMounted = $true
-
-	# Track the boot image mount explicitly so cleanup can recover if
-	# anything below fails.
-
-	try {
-		# Only SYSTEM is modified in boot.wim.
-		# Loading a single hive minimizes registry-lock/cleanup risk.
-		$bootHives = [ordered]@{
-			'HKLM\zSYSTEM' = Join-Path $MOUNT_DIR 'Windows\System32\config\SYSTEM'
-		}
-
-		Write-Step "Loading boot.wim SYSTEM registry hive..."
-
-		# Do NOT blindly call:
-		#   reg.exe unload HKLM\zSYSTEM
-		#
-		# The hive is not expected to be loaded before this operation.
-		# A blind unload produces "The parameter is incorrect" under
-		# some PowerShell/native-command error handling configurations.
-		$loadedBootHives = @(
-			Invoke-RegistryHiveOperations `
-				-Operation Load `
-				-Hives $bootHives
-		)
-
-		if ($loadedBootHives.Count -ne $bootHives.Count) {
-			$expectedBootHives = @($bootHives.Keys)
-
-			$missingBootHives = @(
-				$expectedBootHives | Where-Object {
-					$loadedBootHives -notcontains $_
-				}
-			)
-
-			throw "Failed to load all required boot.wim registry hives. Missing: $($missingBootHives -join ', ')"
-		}
-
-		Write-Ok "Boot.wim SYSTEM registry hive loaded."
-
-		Write-Step "Applying system requirement bypass to boot image..."
-
-		Set-RegistryValuesMap -Map @{
-			'HKLM\zSYSTEM\Setup\LabConfig' = @{
-				'BypassCPUCheck'        = 1
-				'BypassRAMCheck'        = 1
-				'BypassSecureBootCheck' = 1
-				'BypassStorageCheck'    = 1
-				'BypassTPMCheck'        = 1
-			}
-
-			'HKLM\zSYSTEM\Setup\MoSetup' = @{
-				'AllowUpgradesWithUnsupportedTPMOrCPU' = 1
-			}
-		}
-
-		Write-Ok "Boot.wim system requirement bypass applied."
-
-		Write-Step "Unloading boot.wim registry hives..."
-
-		$unloadedBootHives = @(
-			Invoke-RegistryHiveOperations `
-				-Operation Unload `
-				-Hives @($loadedBootHives)
-		)
-
-		if ($unloadedBootHives.Count -ne @($loadedBootHives).Count) {
-			$remainingBootHives = @(
-				@($loadedBootHives) | Where-Object {
-					$unloadedBootHives -notcontains $_
-				}
-			)
-
-			throw "Failed to unload one or more boot.wim registry hives. Still loaded: $($remainingBootHives -join ', ')"
-		}
-
-		# Do not call .Clear() or .Remove() on the returned collection.
-		# Convert it to a plain array after successful unload.
-		$loadedBootHives = @()
-
-		Write-Ok "Boot.wim registry hives unloaded."
-
-		Write-Step "Unmounting and saving boot.wim..."
-
-		Invoke-WindowsImageDismountRobust -MountPath $MOUNT_DIR -Attempts 5 -InitialDelaySeconds 2
-		$bootImageMounted = $false
-
-		[GC]::Collect()
-		[GC]::WaitForPendingFinalizers()
-		Start-Sleep -Seconds 5
-
-		Write-Ok "Boot image customization complete."
-		$mainProgress.CompleteStep()
-
-	}
-	catch {
-		# Best-effort cleanup if boot.wim customization fails.
-		Write-WarningMsg "boot.wim customization failed: $($_.Exception.Message)"
-
-		if ($bootImageMounted) {
-			Write-Step "Attempting to clean up boot.wim mount..."
-
-			# First try to unload any hive that this section successfully loaded.
-			if ($null -ne $loadedBootHives -and @($loadedBootHives).Count -gt 0) {
-				$cleanupUnloaded = @(
-					Invoke-RegistryHiveOperations `
-						-Operation Unload `
-						-Hives @($loadedBootHives)
-				)
-
-				if ($cleanupUnloaded.Count -gt 0) {
-					$loadedBootHives = @(
-						@($loadedBootHives) | Where-Object {
-							$cleanupUnloaded -notcontains $_
-						}
-					)
-				}
-			}
-
-			# Give registry handles a moment to close before DISM attempts
-			# to detach the image.
-			[System.GC]::Collect()
-			[System.GC]::WaitForPendingFinalizers()
-			Start-Sleep -Seconds 2
-
-			try {
-				Invoke-WindowsImageDiscardRobust -MountPath $MOUNT_DIR -Attempts 5
-				$bootImageMounted = $false
-				Write-Ok "Failed boot.wim mount discarded."
-			}
-			catch {
-				Write-WarningMsg "Could not discard failed boot.wim mount: $($_.Exception.Message)"
-			}
-		}
-
-		throw
-	}
-
-	# ==================== CREATE ISO ====================
-	$mainProgress.StartStep("Creating ISO")
-	Write-Banner "Creating ISO" Magenta
-
-	Copy-Item `
-		-Path $autoUnattendPath `
-		-Destination (Join-Path $WORK_DIR "autounattend.xml") `
-		-Force `
-		-ErrorAction Stop
-
-
-
-	$isoPath = Join-Path $PSScriptRoot $script:VersionInfo.ISOFilename
-
-	Write-Step "Building ISO at: $isoPath"
-	Write-Step "This may take several minutes..."
-
-	$etfsBootPath = Join-Path $WORK_DIR "boot\etfsboot.com"
-	$efisysBinPath = Join-Path $WORK_DIR "efi\microsoft\boot\efisys.bin"
-
-	if (-not (Test-Path -LiteralPath $etfsBootPath -PathType Leaf)) {
-		throw "Missing BIOS boot sector file: $etfsBootPath"
-	}
-
-	if (-not (Test-Path -LiteralPath $efisysBinPath -PathType Leaf)) {
-		throw "Missing UEFI boot image: $efisysBinPath"
-	}
-
-	# Microsoft requires a boot-order file for images larger than 4.5 GB so the
-	# boot files remain at the beginning of the image. We always use it; that makes
-	# the generated media safe regardless of the final ISO size.
-	#
-	# The file must be ANSI/ASCII, contain paths relative to the image root,
-	# and end with a newline.
-	$bootOrderPath = Join-Path $ScratchDisk 'GamingWindowsBootOrder.txt'
-
-	$bootOrderCandidates = @(
-		'boot\bcd',
-		'boot\boot.sdi',
-		'boot\bootfix.bin',
-		'boot\bootsect.exe',
-		'boot\etfsboot.com',
-		'boot\memtest.efi',
-		'boot\memtest.exe',
-		'sources\boot.wim'
-	)
-
-	# Include standard localized bootsect MUI files and boot fonts when present.
-	$bootDirectory = Join-Path $WORK_DIR 'boot'
-
-	if (Test-Path -LiteralPath $bootDirectory -PathType Container) {
-		$bootOrderCandidates += @(
-			Get-ChildItem `
-				-LiteralPath $bootDirectory `
-				-Recurse `
-				-File `
-				-Force `
-				-ErrorAction SilentlyContinue |
-			Where-Object {
-				$_.Name -match '^(bootsect\.exe\.mui|.*_boot\.ttf)$'
-			} |
-			ForEach-Object {
-				$_.FullName.Substring($WORK_DIR.Length).TrimStart('\','/') -replace '/','\'
-			}
-		)
-	}
-
-	$bootOrderEntries = @(
-		$bootOrderCandidates |
-		Where-Object {
-			Test-Path -LiteralPath (Join-Path $WORK_DIR $_) -PathType Leaf
-		} |
-		Select-Object -Unique
-	)
-
-	if ($bootOrderEntries.Count -eq 0) {
-		throw "Could not build a valid Oscdimg boot-order file; no required boot files were found."
-	}
-
-	if ('sources\boot.wim' -notin $bootOrderEntries) {
-		throw "Could not build a valid Oscdimg boot-order file; sources\boot.wim is missing."
-	}
-
-	[System.IO.File]::WriteAllLines(
-		$bootOrderPath,
-		$bootOrderEntries,
-		[System.Text.Encoding]::ASCII
-	)
-
-	if (-not (Test-Path -LiteralPath $bootOrderPath -PathType Leaf)) {
-		throw "Failed to create Oscdimg boot-order file '$bootOrderPath'."
-	}
-
-	Write-Ok "Boot-order file created with $($bootOrderEntries.Count) entries."
-
-	# -------------------------------------------------------------------------
-	# Build the OSCDIMG argument list.
-	#
-	# Keep each argument as its own array element. Invoke OSCDIMG directly
-	# instead of going through cmd.exe: PowerShell then passes paths containing
-	# spaces without an additional cmd.exe quoting/parsing layer.
-	# -------------------------------------------------------------------------
-	$oscdimgArgs = @(
-		'-m'
-		'-o'
-		'-u2'
-		'-udfver102'
-		"-yo$bootOrderPath"
-		"-bootdata:2#p0,e,b$etfsBootPath#p0,e,b$efisysBinPath"
-		$WORK_DIR
-		$isoPath
-	)
-
-	Write-Step "Running Oscdimg..."
-
-	# A previous failed build may have left the destination ISO behind.
-	# Remove it before starting so a stale file can never be mistaken for the
-	# output of the current build. Fail explicitly if the old file is locked.
-	if (Test-Path -LiteralPath $isoPath -PathType Leaf) {
-		try {
-			Remove-Item -LiteralPath $isoPath -Force -ErrorAction Stop
-		} catch {
-			throw "The previous ISO '$isoPath' could not be removed before OSCDIMG started. It may be open or locked by another process. $($_.Exception.Message)"
-		}
-	}
-
-	# OSCDIMG is a native executable. Invoke it through Invoke-NativeCommand so
-	# that informational stderr output (banners, progress, "Scanning source
-	# tree") cannot be promoted to a terminating RemoteException under
-	# $ErrorActionPreference = 'Stop'. The helper performs the required
-	# process/argument quoting and returns a structured result.
-	Write-Step "OSCDIMG: $OSCDIMG"
-	Write-Step "OSCDIMG arguments:"
-	foreach ($arg in $oscdimgArgs) {
-		Write-Output "  [$arg]"
-	}
-
-	if (-not (Test-Path -LiteralPath $OSCDIMG -PathType Leaf)) {
-		throw "OSCDIMG executable was not found: $OSCDIMG"
-	}
-
-	$oscdimgResult = Invoke-NativeCommand -FilePath $OSCDIMG -Arguments $oscdimgArgs
-	$oscdimgOutput   = $oscdimgResult.Output
-	$oscdimgExitCode = $oscdimgResult.ExitCode
-
-	Write-Step "OSCDIMG exit code: $oscdimgExitCode"
-	Write-Step "OSCDIMG output:"
-	foreach ($line in $oscdimgOutput) {
-		Write-Output "  $line"
-	}
-
-	if ($oscdimgExitCode -ne 0) {
-		$recentOutput = @(
-			$oscdimgOutput |
-			Select-Object -Last 20 |
-			ForEach-Object { [string]$_ }
-		) -join [Environment]::NewLine
-
-		throw "OSCDIMG failed with exit code $oscdimgExitCode.$([Environment]::NewLine)$recentOutput"
-	}
-
-	if (-not (Test-Path -LiteralPath $isoPath -PathType Leaf)) {
-		throw "OSCDIMG returned success but did not create the expected ISO: $isoPath"
-	}
-
-	if ((Get-Item -LiteralPath $isoPath).Length -le 0) {
-		throw "OSCDIMG returned success but the ISO file is empty: $isoPath"
-	}
-
-	Write-Ok "OSCDIMG created the ISO successfully."
-
-	# -------------------------------------------------------------------------
-	# Validate the generated ISO.
-	#
-	# Primary validation is the source tree: OSCDIMG already read it and
-	# reported success, so re-checking that every required file is present and
-	# non-empty catches every realistic post-OSCDIMG failure mode without
-	# depending on the ISO mount (which races the volume service and, on some
-	# configurations, silently fails to attach a user-created ISO).
-	#
-	# Secondary validation mounts the ISO and inspects its contents. This is
-	# best-effort: if the mount fails or a drive letter is never assigned, we
-	# log a warning and continue. The source tree has already been proven.
-	# -------------------------------------------------------------------------
-	Write-Step "Validating the generated ISO contents..."
-
-	$requiredTreeFiles = @(
-		$WIM_PATH,
-		$BOOT_WIM_PATH,
-		$etfsBootPath,
-		$efisysBinPath,
-		(Join-Path $WORK_DIR 'autounattend.xml')
-	)
-	foreach ($requiredFile in $requiredTreeFiles) {
-		if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
-			throw "ISO validation failed: required source-tree file is missing after OSCDIMG: $requiredFile"
-		}
-		$fi = Get-Item -LiteralPath $requiredFile -ErrorAction Stop
-		if ($fi.Length -le 0) {
-			throw "ISO validation failed: required source-tree file is empty after OSCDIMG: $requiredFile"
-		}
-	}
-	Write-Ok "Source-tree validation passed: all OSCDIMG inputs are present and non-empty."
-
-	# Re-validate the final WIM metadata in the source tree. This is the same
-	# check that used to happen via the mounted ISO and is what actually matters.
-	$finalWimImages = @(Get-WindowsImage -ImagePath $WIM_PATH -ErrorAction Stop)
-	if ($finalWimImages.Count -ne 1 -or $finalWimImages[0].ImageIndex -ne 1) {
-		throw "Final install.wim is not the expected single-image WIM."
-	}
-
-	$isoMounted = $false
-	$isoRoot = $null
-
-	try {
-		# Mount-DiskImage returns before the volume is attached; retry until the
-		# image reports Attached = True. Suppress the returned object explicitly
-		# (piping to Out-Null is not sufficient on some hosts).
-		$mountDeadline = (Get-Date).AddSeconds(20)
-		while ((Get-Date) -lt $mountDeadline) {
-			$null = Mount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
-
-			$diskImage = Get-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
-			if ($diskImage -and $diskImage.Attached) {
-				$isoMounted = $true
-				break
-			}
-
-			Start-Sleep -Milliseconds 500
-		}
-
-		if (-not $isoMounted) {
-			Write-WarningMsg "Could not attach the generated ISO for content validation; skipping mount-based checks. This does not affect the ISO itself."
-		}
-		else {
-			# Poll for a volume with a drive letter. Volume arrival can take
-			# several seconds after Attached flips to True.
-			$volumeDeadline = (Get-Date).AddSeconds(20)
-			$isoVolume = $null
-			while ((Get-Date) -lt $volumeDeadline) {
-				$isoVolume = Get-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue |
-					Get-Disk -ErrorAction SilentlyContinue |
-					Get-Partition -ErrorAction SilentlyContinue |
-					Get-Volume -ErrorAction SilentlyContinue |
-					Where-Object { $_.DriveLetter } |
-					Select-Object -First 1
-
-				if ($isoVolume) { break }
-				Start-Sleep -Milliseconds 500
-			}
-
-			if (-not $isoVolume) {
-				Write-WarningMsg "Generated ISO attached but no drive letter was assigned within the timeout; skipping mount-based content checks."
-			}
-			else {
-				$isoRoot = "$($isoVolume.DriveLetter):\"
-				Write-Step "ISO mounted at $isoRoot; verifying contents..."
-
-				$isoMissing = @()
-				foreach ($requiredIsoFile in @(
-					"sources\install.wim",
-					"sources\boot.wim",
-					"boot\etfsboot.com",
-					"efi\microsoft\boot\efisys.bin",
-					"autounattend.xml"
-				)) {
-					$requiredPath = Join-Path $isoRoot $requiredIsoFile
-					if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
-						$isoMissing += $requiredIsoFile
-					}
-				}
-
-				if ($isoMissing.Count -gt 0) {
-					# Fall back to warning rather than failing: the source tree
-					# validation already proved OSCDIMG had every required file,
-					# and some environments expose an ISO volume in a form that
-					# Test-Path cannot traverse reliably (e.g. UDF edge cases).
-					Write-WarningMsg "Mount-based ISO validation could not see: $($isoMissing -join ', '). The source tree was validated successfully, so the ISO is very likely complete."
-				}
-				else {
-					# Only run the WIM metadata check if the file was actually visible.
-					$isoWimPath = Join-Path $isoRoot "sources\install.wim"
-					try {
-						$isoWimImages = @(Get-WindowsImage -ImagePath $isoWimPath -ErrorAction Stop)
-						if ($isoWimImages.Count -ne 1 -or $isoWimImages[0].ImageIndex -ne 1) {
-							Write-WarningMsg "Generated ISO's install.wim metadata did not report exactly one image at index 1."
-						} else {
-							Write-Ok "Generated ISO mounted and required contents/WIM metadata verified."
-						}
-					}
-					catch {
-						Write-WarningMsg "Could not read install.wim from the mounted ISO: $($_.Exception.Message)"
-					}
-				}
-			}
-		}
-	}
-	finally {
-		if ($isoMounted) {
-			try {
-				Dismount-DiskImage -ImagePath $isoPath -ErrorAction Stop
-				$isoMounted = $false
-			}
-			catch {
-				Write-WarningMsg "Could not automatically dismount validation ISO: $($_.Exception.Message)"
-			}
-		}
-	}
-
-	$mainProgress.CompleteStep()
-	# Success is reported only after the outer finally block has completed all
-	# cleanup and verified that no DISM mount/hive was left behind.
+    $mainProgress.StartStep("Customizing boot.wim")
+    Write-Banner "Customizing boot.wim" Magenta
+
+    if (-not (Test-Path -LiteralPath $BOOT_WIM_PATH)) {
+        Write-ErrorMessage "boot.wim not found at $BOOT_WIM_PATH"
+        throw "Missing boot.wim"
+    }
+
+    $bootImages = @(Get-WindowsImage -ImagePath $BOOT_WIM_PATH -ErrorAction Stop)
+
+    if ($bootImages.Count -eq 0) {
+        throw "No images found in boot.wim."
+    }
+
+    $setupImage = $bootImages |
+        Where-Object {
+            $_.ImageName -match '(?i)Windows.*Setup|Microsoft.*Setup'
+        } |
+        Select-Object -First 1
+
+    if ($setupImage) {
+        $bootIndex = [int]$setupImage.ImageIndex
+    } elseif ($bootImages | Where-Object { $_.ImageIndex -eq 2 }) {
+        $bootIndex = 2
+    } else {
+        $bootIndex = [int]$bootImages[0].ImageIndex
+        Write-WarningMsg "Could not identify a Windows Setup image by name; falling back to boot.wim index $bootIndex."
+    }
+
+    Write-Step "Using boot.wim index $bootIndex"
+
+    if (-not (Invoke-TakeOwnership -Path $BOOT_WIM_PATH)) {
+        throw "Failed to prepare boot.wim for mounting: ownership/ACL update failed."
+    }
+
+    Set-ItemProperty `
+        -Path $BOOT_WIM_PATH `
+        -Name IsReadOnly `
+        -Value $false `
+        -ErrorAction Stop
+
+    Write-Step "Verifying DISM mount state before mounting boot.wim..."
+    $bootMountConflicts = @(Get-DismMountedImagesSafe | Where-Object {
+        ($_.MountPath -and (Test-SameWindowsPath ([string]$_.MountPath) $MOUNT_DIR)) -or
+        ($_.ImagePath -and (Test-SameWindowsPath ([string]$_.ImagePath) $BOOT_WIM_PATH))
+    })
+    if ($bootMountConflicts.Count -gt 0) {
+        $details = ($bootMountConflicts | ForEach-Object { "MountPath='$($_.MountPath)', ImagePath='$($_.ImagePath)'" }) -join '; '
+        throw "Refusing to mount boot.wim because DISM already reports a conflicting mount: $details"
+    }
+
+    Write-Step "Mounting boot.wim (Index $bootIndex)..."
+
+    Mount-WindowsImage `
+        -ImagePath $BOOT_WIM_PATH `
+        -Index $bootIndex `
+        -Path $MOUNT_DIR `
+        -CheckIntegrity `
+        -ErrorAction Stop
+
+    $bootImageMounted = $true
+
+    try {
+        $bootHives = [ordered]@{
+            'HKLM\zSYSTEM' = Join-Path $MOUNT_DIR 'Windows\System32\config\SYSTEM'
+        }
+
+        Write-Step "Loading boot.wim SYSTEM registry hive..."
+
+        $loadedBootHives = @(
+            Invoke-RegistryHiveOperations `
+                -Operation Load `
+                -Hives $bootHives
+        )
+
+        if ($loadedBootHives.Count -ne $bootHives.Count) {
+            $expectedBootHives = @($bootHives.Keys)
+
+            $missingBootHives = @(
+                $expectedBootHives | Where-Object {
+                    $loadedBootHives -notcontains $_
+                }
+            )
+
+            throw "Failed to load all required boot.wim registry hives. Missing: $($missingBootHives -join ', ')"
+        }
+
+        Write-Ok "Boot.wim SYSTEM registry hive loaded."
+
+        Write-Step "Applying system requirement bypass to boot image..."
+
+        Set-RegistryValuesMap -Map @{
+            'HKLM\zSYSTEM\Setup\LabConfig' = @{
+                'BypassCPUCheck'        = 1
+                'BypassRAMCheck'        = 1
+                'BypassSecureBootCheck' = 1
+                'BypassStorageCheck'    = 1
+                'BypassTPMCheck'        = 1
+            }
+
+            'HKLM\zSYSTEM\Setup\MoSetup' = @{
+                'AllowUpgradesWithUnsupportedTPMOrCPU' = 1
+            }
+        }
+
+        Write-Ok "Boot.wim system requirement bypass applied."
+
+        Write-Step "Unloading boot.wim registry hives..."
+
+        $unloadedBootHives = @(
+            Invoke-RegistryHiveOperations `
+                -Operation Unload `
+                -Hives @($loadedBootHives)
+        )
+
+        if ($unloadedBootHives.Count -ne @($loadedBootHives).Count) {
+            $remainingBootHives = @(
+                @($loadedBootHives) | Where-Object {
+                    $unloadedBootHives -notcontains $_
+                }
+            )
+
+            throw "Failed to unload one or more boot.wim registry hives. Still loaded: $($remainingBootHives -join ', ')"
+        }
+
+        $loadedBootHives = @()
+
+        Write-Ok "Boot.wim registry hives unloaded."
+
+        Write-Step "Unmounting and saving boot.wim..."
+
+        Invoke-WindowsImageDismountRobust -MountPath $MOUNT_DIR -Attempts 5 -InitialDelaySeconds 2
+        $bootImageMounted = $false
+
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        Start-Sleep -Seconds 5
+
+        Write-Ok "Boot image customization complete."
+        $mainProgress.CompleteStep()
+
+    }
+    catch {
+        Write-WarningMsg "boot.wim customization failed: $($_.Exception.Message)"
+
+        if ($bootImageMounted) {
+            Write-Step "Attempting to clean up boot.wim mount..."
+
+            if ($null -ne $loadedBootHives -and @($loadedBootHives).Count -gt 0) {
+                $cleanupUnloaded = @(
+                    Invoke-RegistryHiveOperations `
+                        -Operation Unload `
+                        -Hives @($loadedBootHives)
+                )
+
+                if ($cleanupUnloaded.Count -gt 0) {
+                    $loadedBootHives = @(
+                        @($loadedBootHives) | Where-Object {
+                            $cleanupUnloaded -notcontains $_
+                        }
+                    )
+                }
+            }
+
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+            Start-Sleep -Seconds 2
+
+            try {
+                Invoke-WindowsImageDiscardRobust -MountPath $MOUNT_DIR -Attempts 5
+                $bootImageMounted = $false
+                Write-Ok "Failed boot.wim mount discarded."
+            }
+            catch {
+                Write-WarningMsg "Could not discard failed boot.wim mount: $($_.Exception.Message)"
+            }
+        }
+
+        throw
+    }
+
+    # ==================== CREATE ISO ====================
+    $mainProgress.StartStep("Creating ISO")
+    Write-Banner "Creating ISO" Magenta
+
+    Copy-Item `
+        -Path $autoUnattendPath `
+        -Destination (Join-Path $WORK_DIR "autounattend.xml") `
+        -Force `
+        -ErrorAction Stop
+
+    $isoPath = Join-Path $PSScriptRoot $script:VersionInfo.ISOFilename
+
+    Write-Step "Building ISO at: $isoPath"
+    Write-Step "This may take several minutes..."
+
+    $etfsBootPath = Join-Path $WORK_DIR "boot\etfsboot.com"
+    $efisysBinPath = Join-Path $WORK_DIR "efi\microsoft\boot\efisys.bin"
+
+    if (-not (Test-Path -LiteralPath $etfsBootPath -PathType Leaf)) {
+        throw "Missing BIOS boot sector file: $etfsBootPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $efisysBinPath -PathType Leaf)) {
+        throw "Missing UEFI boot image: $efisysBinPath"
+    }
+
+    $bootOrderPath = Join-Path $ScratchDisk 'GamingWindowsBootOrder.txt'
+
+    $bootOrderCandidates = @(
+        'boot\bcd',
+        'boot\boot.sdi',
+        'boot\bootfix.bin',
+        'boot\bootsect.exe',
+        'boot\etfsboot.com',
+        'boot\memtest.efi',
+        'boot\memtest.exe',
+        'sources\boot.wim'
+    )
+
+    $bootDirectory = Join-Path $WORK_DIR 'boot'
+
+    if (Test-Path -LiteralPath $bootDirectory -PathType Container) {
+        $bootOrderCandidates += @(
+            Get-ChildItem `
+                -LiteralPath $bootDirectory `
+                -Recurse `
+                -File `
+                -Force `
+                -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match '^(bootsect\.exe\.mui|.*_boot\.ttf)$'
+            } |
+            ForEach-Object {
+                $_.FullName.Substring($WORK_DIR.Length).TrimStart('\','/') -replace '/','\'
+            }
+        )
+    }
+
+    $bootOrderEntries = @(
+        $bootOrderCandidates |
+        Where-Object {
+            Test-Path -LiteralPath (Join-Path $WORK_DIR $_) -PathType Leaf
+        } |
+        Select-Object -Unique
+    )
+
+    if ($bootOrderEntries.Count -eq 0) {
+        throw "Could not build a valid Oscdimg boot-order file; no required boot files were found."
+    }
+
+    if ('sources\boot.wim' -notin $bootOrderEntries) {
+        throw "Could not build a valid Oscdimg boot-order file; sources\boot.wim is missing."
+    }
+
+    [System.IO.File]::WriteAllLines(
+        $bootOrderPath,
+        $bootOrderEntries,
+        [System.Text.Encoding]::ASCII
+    )
+
+    if (-not (Test-Path -LiteralPath $bootOrderPath -PathType Leaf)) {
+        throw "Failed to create Oscdimg boot-order file '$bootOrderPath'."
+    }
+
+    Write-Ok "Boot-order file created with $($bootOrderEntries.Count) entries."
+
+    $oscdimgArgs = @(
+        '-m'
+        '-o'
+        '-u2'
+        '-udfver102'
+        "-yo$bootOrderPath"
+        "-bootdata:2#p0,e,b$etfsBootPath#p0,e,b$efisysBinPath"
+        $WORK_DIR
+        $isoPath
+    )
+
+    Write-Step "Running Oscdimg..."
+
+    if (Test-Path -LiteralPath $isoPath -PathType Leaf) {
+        try {
+            Remove-Item -LiteralPath $isoPath -Force -ErrorAction Stop
+        } catch {
+            throw "The previous ISO '$isoPath' could not be removed before OSCDIMG started. It may be open or locked by another process. $($_.Exception.Message)"
+        }
+    }
+
+    Write-Step "OSCDIMG: $OSCDIMG"
+    Write-Step "OSCDIMG arguments:"
+    foreach ($arg in $oscdimgArgs) {
+        Write-Output "  [$arg]"
+    }
+
+    if (-not (Test-Path -LiteralPath $OSCDIMG -PathType Leaf)) {
+        throw "OSCDIMG executable was not found: $OSCDIMG"
+    }
+
+    $oscdimgResult = Invoke-NativeCommand -FilePath $OSCDIMG -Arguments $oscdimgArgs
+    $oscdimgOutput   = $oscdimgResult.Output
+    $oscdimgExitCode = $oscdimgResult.ExitCode
+
+    Write-Step "OSCDIMG exit code: $oscdimgExitCode"
+    Write-Step "OSCDIMG output:"
+    foreach ($line in $oscdimgOutput) {
+        Write-Output "  $line"
+    }
+
+    if ($oscdimgExitCode -ne 0) {
+        $recentOutput = @(
+            $oscdimgOutput |
+            Select-Object -Last 20 |
+            ForEach-Object { [string]$_ }
+        ) -join [Environment]::NewLine
+
+        throw "OSCDIMG failed with exit code $oscdimgExitCode.$([Environment]::NewLine)$recentOutput"
+    }
+
+    if (-not (Test-Path -LiteralPath $isoPath -PathType Leaf)) {
+        throw "OSCDIMG returned success but did not create the expected ISO: $isoPath"
+    }
+
+    if ((Get-Item -LiteralPath $isoPath).Length -le 0) {
+        throw "OSCDIMG returned success but the ISO file is empty: $isoPath"
+    }
+
+    Write-Ok "OSCDIMG created the ISO successfully."
+
+    Write-Step "Validating the generated ISO contents..."
+
+    $requiredTreeFiles = @(
+        $WIM_PATH,
+        $BOOT_WIM_PATH,
+        $etfsBootPath,
+        $efisysBinPath,
+        (Join-Path $WORK_DIR 'autounattend.xml')
+    )
+    foreach ($requiredFile in $requiredTreeFiles) {
+        if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+            throw "ISO validation failed: required source-tree file is missing after OSCDIMG: $requiredFile"
+        }
+        $fi = Get-Item -LiteralPath $requiredFile -ErrorAction Stop
+        if ($fi.Length -le 0) {
+            throw "ISO validation failed: required source-tree file is empty after OSCDIMG: $requiredFile"
+        }
+    }
+    Write-Ok "Source-tree validation passed: all OSCDIMG inputs are present and non-empty."
+
+    $finalWimImages = @(Get-WindowsImage -ImagePath $WIM_PATH -ErrorAction Stop)
+    if ($finalWimImages.Count -ne 1 -or $finalWimImages[0].ImageIndex -ne 1) {
+        throw "Final install.wim is not the expected single-image WIM."
+    }
+
+    $isoMounted = $false
+    $isoRoot = $null
+
+    try {
+        $mountDeadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $mountDeadline) {
+            $null = Mount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
+
+            $diskImage = Get-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
+            if ($diskImage -and $diskImage.Attached) {
+                $isoMounted = $true
+                break
+            }
+
+            Start-Sleep -Milliseconds 500
+        }
+
+        if (-not $isoMounted) {
+            Write-WarningMsg "Could not attach the generated ISO for content validation; skipping mount-based checks. This does not affect the ISO itself."
+        }
+        else {
+            $volumeDeadline = (Get-Date).AddSeconds(20)
+            $isoVolume = $null
+            while ((Get-Date) -lt $volumeDeadline) {
+                $isoVolume = Get-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue |
+                    Get-Disk -ErrorAction SilentlyContinue |
+                    Get-Partition -ErrorAction SilentlyContinue |
+                    Get-Volume -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DriveLetter } |
+                    Select-Object -First 1
+
+                if ($isoVolume) { break }
+                Start-Sleep -Milliseconds 500
+            }
+
+            if (-not $isoVolume) {
+                Write-WarningMsg "Generated ISO attached but no drive letter was assigned within the timeout; skipping mount-based content checks."
+            }
+            else {
+                $isoRoot = "$($isoVolume.DriveLetter):\"
+                Write-Step "ISO mounted at $isoRoot; verifying contents..."
+
+                $isoMissing = @()
+                foreach ($requiredIsoFile in @(
+                    "sources\install.wim",
+                    "sources\boot.wim",
+                    "boot\etfsboot.com",
+                    "efi\microsoft\boot\efisys.bin",
+                    "autounattend.xml"
+                )) {
+                    $requiredPath = Join-Path $isoRoot $requiredIsoFile
+                    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+                        $isoMissing += $requiredIsoFile
+                    }
+                }
+
+                if ($isoMissing.Count -gt 0) {
+                    Write-WarningMsg "Mount-based ISO validation could not see: $($isoMissing -join ', '). The source tree was validated successfully, so the ISO is very likely complete."
+                }
+                else {
+                    $isoWimPath = Join-Path $isoRoot "sources\install.wim"
+                    try {
+                        $isoWimImages = @(Get-WindowsImage -ImagePath $isoWimPath -ErrorAction Stop)
+                        if ($isoWimImages.Count -ne 1 -or $isoWimImages[0].ImageIndex -ne 1) {
+                            Write-WarningMsg "Generated ISO's install.wim metadata did not report exactly one image at index 1."
+                        } else {
+                            Write-Ok "Generated ISO mounted and required contents/WIM metadata verified."
+                        }
+                    }
+                    catch {
+                        Write-WarningMsg "Could not read install.wim from the mounted ISO: $($_.Exception.Message)"
+                    }
+                }
+            }
+        }
+    }
+    finally {
+        if ($isoMounted) {
+            try {
+                Dismount-DiskImage -ImagePath $isoPath -ErrorAction Stop
+                $isoMounted = $false
+            }
+            catch {
+                Write-WarningMsg "Could not automatically dismount validation ISO: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    $mainProgress.CompleteStep()
     $buildSucceeded = $true
 }
 catch {
@@ -3337,10 +3001,6 @@ finally {
     # ========================================================================
     # GUARANTEED CLEANUP
     # ========================================================================
-    # This block deliberately contains NO build work. It executes on success,
-    # terminating errors, explicit throws, and failures from nested operations.
-    # Never delete a directory while DISM reports it as mounted or when mount
-    # state cannot be determined.
     Write-Banner "Cleanup" Cyan
 
     # ---- Dismount validation ISO first. ------------------------------------
@@ -3409,8 +3069,28 @@ finally {
         }
     }
 
+    # ---- Force-unload any orphaned cleanup hives before DISM recovery ------
+    # Even if a hive went out of scope of $loadedHives or $loadedCleanupHives
+    # due to an unexpected error path, this sweep makes sure the underlying
+    # mount-directory files (SOFTWARE, SYSTEM, DEFAULT, NTUSER.DAT) are no
+    # longer held by the registry subsystem.
+    $orphanHives = @(
+        'HKLM\zCLEAN_SOFTWARE', 'HKLM\zCLEAN_SYSTEM', 'HKLM\zCLEAN_DEFAULT',
+        'HKLM\zDEFAULT', 'HKLM\zNTUSER', 'HKLM\zSOFTWARE', 'HKLM\zSYSTEM'
+    )
+    # Include dynamic per-user cleanup hives.
+    for ($i = 1; $i -le 20; $i++) {
+        $orphanHives += ('HKLM\zCLEAN_USER{0:D2}' -f $i)
+    }
+    foreach ($orphanHive in $orphanHives) {
+        $probe = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('query', $orphanHive)
+        if ($probe.ExitCode -eq 0) {
+            Write-WarningMsg "Orphaned hive '$orphanHive' still loaded; forcing unload before DISM recovery."
+            $null = Invoke-RegistryHiveOperations -Operation Unload -Hives @($orphanHive)
+        }
+    }
+
     # ---- Recover any remaining build-related DISM mounts. ------------------
-    # Actual DISM state is authoritative; boolean flags alone are not.
     $mountStateKnown = $false
     $activeBuildMounts = @()
     try {
@@ -3458,7 +3138,7 @@ finally {
         }
     }
 
-    # ---- Remove work tree only when mount state is positively known safe. ---
+    # ---- Remove work tree only when mount state is positively known safe. --
     if ($mountCheckSucceeded -and -not $mountStillActive) {
         if ($script:ExitCode -ne 0 -and $PreserveWorkOnError) {
             Write-WarningMsg "Preserving work directories because -PreserveWorkOnError was specified."
@@ -3491,7 +3171,6 @@ finally {
         try { $mainProgress.Complete() } catch { Write-WarningMsg "Could not finalize progress display: $($_.Exception.Message)" }
     }
 
-    # Only claim success AFTER guaranteed cleanup has completed.
     if ($buildSucceeded -and $script:ExitCode -eq 0) {
         Write-Banner "ISO CREATED SUCCESSFULLY" Green
         Write-Output "  Version:  $($script:VersionInfo.FullVersionWithBuild)"
@@ -3520,5 +3199,4 @@ finally {
     }
 }
 
-# Exit with the accumulated code so schedulers/CI see the real status.
 exit $script:ExitCode
