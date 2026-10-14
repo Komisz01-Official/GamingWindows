@@ -38,7 +38,7 @@ param (
 # ==================== CENTRALIZED VERSION CONTROL ====================
 $script:VersionInfo = @{
     Major      = 0
-    Minor      = 0
+    Minor      = 1
     Patch      = 1
     Build      = (Get-Date -Format 'yyyyMMdd')
     Codename   = "IsoValidation"
@@ -1834,7 +1834,12 @@ $index = $null
             'MicrosoftCorporationII.MicrosoftFamily_', 'MicrosoftCorporationII.QuickAssist_',
             'MicrosoftTeams_', 'Microsoft.549981C3F5F10_', 'Microsoft.Windows.Copilot',
             'MSTeams_', 'Microsoft.OutlookForWindows_', 'Microsoft.Windows.Teams_',
-            'Microsoft.Copilot_'
+            'Microsoft.Copilot_', 'Microsoft.Microsoft3DViewer_',
+            'Microsoft.MixedReality.Portal_',
+            'Microsoft.Office.OneNote_',
+            'Microsoft.SkypeApp_',
+            'Microsoft.MicrosoftStickyNotes_',
+            'Microsoft.Wallet_'
         )
 
         $pkgResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
@@ -1888,6 +1893,63 @@ $index = $null
         } else {
             Write-WarningMsg "No bloatware packages found to remove."
         }
+
+		# ---------------------------------------------------------------------
+        # Removal of facial recognition, handwriting/speech recognition, and Recall
+        # ---------------------------------------------------------------------
+        Write-Step "Removing specialized Windows capabilities (Face Recognition, Handwriting, Speech)..."
+
+        # 1. Querying available Windows capabilities from the offline image file
+        \$capResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+            '/English', "/image:\$MOUNT_DIR", '/Get-Capabilities'
+        )
+        
+        if (\$capResult.ExitCode -eq 0) {
+            # We extract the handwriting, speech, and face recognition modules using regex filtering
+            \(capsToRemove = @(\)capResult.Output | ForEach-Object {
+                if (\(_ -match 'Capability Identity\s*:\s*(.*)') {\)matches[1].Trim() }
+            } | Where-Object {
+                \$_ -match '(?i)Language\.Handwriting' -or 
+                \(_ -match '(?i)Language\.Speech' -or\)_ -match '(?i)WinBio\.Face'
+            })
+
+            if (\(capsToRemove.Count -gt 0) {\)currentCap = 0
+                foreach (\$cap in \(capsToRemove) {\)currentCap++
+                    Write-ProgressSafe -Activity "Removing Windows Capabilities" `
+                        -Status "($currentCap/$($capsToRemove.Count)) $cap" `
+                        -PercentComplete ((currentCap / capsToRemove.Count) * 100)
+
+                    \$capRemoveResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+                        '/English', "/image:\(MOUNT_DIR", '/Remove-Capability', "/CapabilityName:\)cap"
+                    )
+                    if (\$capRemoveResult.ExitCode -eq 0) {
+                        Write-Ok "Successfully removed capability: \$cap"
+                    } else {
+                        Write-WarningMsg "Failed to remove capability: \$cap (DISM exit code (capRemoveResult.ExitCode))"
+                    }
+                }
+                Write-ProgressSafe -Activity "Removing Windows Capabilities" -Completed
+            } else {
+                Write-Step "No matching Speech, Handwriting, or Face capabilities found."
+            }
+        } else {
+            Write-WarningMsg "Failed to enumerate Windows Capabilities (DISM exit code (capResult.ExitCode))."
+        }
+
+        # 2. Completely disabling and removing the Windows Recall AI feature
+        Write-Step "Disabling Windows Recall feature..."
+        \$recallResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+            '/English', "/image:\$MOUNT_DIR", '/Disable-Feature', '/FeatureName:Recall', '/Remove'
+        )
+        
+        if (\$recallResult.ExitCode -eq 0) {
+            Write-Ok "Windows Recall successfully disabled and binaries queued for removal."
+        } else {
+            # If the script processes an older Windows 11 version (e.g. a build before 22H2/23H2),
+            # Recall does not exist in it at all yet. For this reason, this is merely a warning, not a critical error.
+            Write-WarningMsg "Windows Recall feature was not found or could not be disabled. (Normal on older Windows 11 builds)."
+        }
+		
         $mainProgress.CompleteStep()
     } else {
         $mainProgress.StartStep("Skipping bloatware removal")
