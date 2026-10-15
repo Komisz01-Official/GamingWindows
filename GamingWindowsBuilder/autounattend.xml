@@ -144,7 +144,7 @@
             <Description>Local administrator account for maintenance and initial setup.</Description>
             <Group>Administrators</Group>
             <Password>
-              <Value>Admin</Value>
+              <Value>Gamer</Value>
               <PlainText>true</PlainText>
             </Password>
           </LocalAccount>
@@ -160,7 +160,7 @@
       -->
       <AutoLogon>
         <Password>
-          <Value>Admin</Value>
+          <Value>Gamer</Value>
           <PlainText>true</PlainText>
         </Password>
         <Enabled>true</Enabled>
