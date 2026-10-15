@@ -11,7 +11,7 @@
       - German keyboard (primary), Hungarian keyboard (secondary)
       - Optional TPM / Secure Boot / RAM setup bypasses retained from the source XML
       - Two local accounts:
-          Admin = local administrator, NOT used for daily work
+          Admin = local administrator, NOT used for daily work, password is temporarily set to 0x8030000C
           User  = standard user, intended for daily work ("Gamer" is the display name)
       - Single-use auto-logon as the daily-driver account so FirstLogonCommands
         can run before any interactive logon. AutoLogon is disabled after the
@@ -144,7 +144,7 @@
             <Description>Local administrator account for maintenance and initial setup.</Description>
             <Group>Administrators</Group>
             <Password>
-              <Value>Gamer</Value>
+              <Value>0x8030000C</Value>
               <PlainText>true</PlainText>
             </Password>
           </LocalAccount>
@@ -160,7 +160,7 @@
       -->
       <AutoLogon>
         <Password>
-          <Value>Gamer</Value>
+          <Value>0x8030000C</Value>
           <PlainText>true</PlainText>
         </Password>
         <Enabled>true</Enabled>
