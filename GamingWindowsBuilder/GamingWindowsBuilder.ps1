@@ -1696,10 +1696,12 @@ $index = $null
         $capResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
             '/English', "/image:$MOUNT_DIR", '/Get-Capabilities'
         )
-        
+
         if ($capResult.ExitCode -eq 0) {
-        
-            $capsToRemove = @(
+            # /Get-Capabilities also lists capabilities that are NotPresent.
+            # Query each candidate's state before attempting removal so that
+            # absent language packs do not generate DISM error 87 noise.
+            $capsToCheck = @(
                 $capResult.Output | ForEach-Object {
                     if ($_ -match 'Capability Identity\s*:\s*(.*)') {
                         $matches[1].Trim()
@@ -1708,44 +1710,70 @@ $index = $null
                     $_ -match '(?i)Language\.Handwriting' -or
                     $_ -match '(?i)Language\.Speech' -or
                     $_ -match '(?i)WinBio\.Face'
-                }
+                } | Select-Object -Unique
             )
-        
+
+            $capsToRemove = [System.Collections.Generic.List[string]]::new()
+            foreach ($cap in $capsToCheck) {
+                $infoResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+                    '/English',
+                    "/image:$MOUNT_DIR",
+                    '/Get-CapabilityInfo',
+                    "/CapabilityName:$cap"
+                )
+
+                if ($infoResult.ExitCode -ne 0) {
+                    Write-WarningMsg "Could not query state for capability '$cap' (DISM exit code $($infoResult.ExitCode)); skipping it."
+                    continue
+                }
+
+                $stateMatch = $infoResult.Output | Where-Object { $_ -match '^\s*State\s*:\s*(.+?)\s*$' } | Select-Object -First 1
+                if (-not $stateMatch) {
+                    Write-WarningMsg "DISM did not report a state for capability '$cap'; skipping it."
+                    continue
+                }
+
+                $capState = ($stateMatch -replace '^\s*State\s*:\s*', '').Trim()
+                if ($capState -match '^(?i:Installed|Staged)$') {
+                    $capsToRemove.Add($cap)
+                }
+                else {
+                    Write-Step "Skipping capability not installed/staged: $cap (state: $capState)"
+                }
+            }
+
             if ($capsToRemove.Count -gt 0) {
                 $currentCap = 0
-        
                 foreach ($cap in $capsToRemove) {
                     $currentCap++
-        
                     Write-ProgressSafe -Activity "Removing Windows Capabilities" `
                         -Status "($currentCap/$($capsToRemove.Count)) $cap" `
                         -PercentComplete (($currentCap / $capsToRemove.Count) * 100)
-        
+
                     $capRemoveResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
                         '/English',
                         "/image:$MOUNT_DIR",
                         '/Remove-Capability',
                         "/CapabilityName:$cap"
                     )
-        
+
                     if ($capRemoveResult.ExitCode -eq 0) {
                         Write-Ok "Successfully removed capability: $cap"
                     }
                     else {
-                        Write-WarningMsg "Failed to remove capability: $cap (DISM exit code $($capRemoveResult.ExitCode))"
+                        Write-WarningMsg "Failed to remove capability: $cap (DISM exit code $($capRemoveResult.ExitCode)): $($capRemoveResult.Output -join ' ')"
                     }
                 }
-        
                 Write-ProgressSafe -Activity "Removing Windows Capabilities" -Completed
             }
             else {
-                Write-Step "No matching Speech, Handwriting, or Face capabilities found."
+                Write-Step "No installed/staged matching Speech, Handwriting, or Face capabilities found."
             }
         }
         else {
-            Write-WarningMsg "Failed to enumerate Windows Capabilities (DISM exit code $($capResult.ExitCode))."
+            Write-WarningMsg "Failed to enumerate Windows Capabilities (DISM exit code $($capResult.ExitCode)): $($capResult.Output -join ' ')"
         }
-        
+
         Write-Step "Disabling Windows Recall feature..."
         
         $recallResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
@@ -2139,9 +2167,25 @@ $index = $null
             'HKLM\zCLEAN_SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'
         )) {
             $providerOverlayRoot = "Registry::$overlayRoot"
-            if (Test-Path -LiteralPath $providerOverlayRoot) {
-                foreach ($overlay in @(Get-ChildItem -LiteralPath $providerOverlayRoot -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '(?i)OneDrive' })) {
+            # Registry provider paths can disappear between checks on newer
+            # Windows images. Treat absent optional overlay branches as normal.
+            $overlayChildren = @()
+            try {
+                if (Test-Path -LiteralPath $providerOverlayRoot -ErrorAction SilentlyContinue) {
+                    $overlayChildren = @(Get-ChildItem -LiteralPath $providerOverlayRoot -ErrorAction SilentlyContinue |
+                        Where-Object { $_.PSChildName -match '(?i)OneDrive' })
+                }
+            }
+            catch {
+                Write-Step "Skipping unavailable optional registry branch '$overlayRoot'."
+                $overlayChildren = @()
+            }
+            foreach ($overlay in $overlayChildren) {
+                try {
                     Remove-RegistryKeyIfExists -RegistryPath "$overlayRoot\$($overlay.PSChildName)" -Description 'OneDrive shell overlay registration'
+                }
+                catch {
+                    Write-WarningMsg "Could not clean optional OneDrive overlay '$($overlay.PSChildName)': $($_.Exception.Message)"
                 }
             }
         }
@@ -2157,9 +2201,23 @@ $index = $null
             Remove-RegistryValueIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Run" -ValueName 'OneDrive' -Description 'OneDrive user startup entry'
             Remove-RegistryValueIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Run" -ValueName 'OneDriveSetup' -Description 'OneDrive user startup entry'
             $userOverlayRoot = "Registry::$hiveName\Software\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers"
-            if (Test-Path -LiteralPath $userOverlayRoot) {
-                foreach ($overlay in @(Get-ChildItem -LiteralPath $userOverlayRoot -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '(?i)OneDrive' })) {
+            $userOverlayChildren = @()
+            try {
+                if (Test-Path -LiteralPath $userOverlayRoot -ErrorAction SilentlyContinue) {
+                    $userOverlayChildren = @(Get-ChildItem -LiteralPath $userOverlayRoot -ErrorAction SilentlyContinue |
+                        Where-Object { $_.PSChildName -match '(?i)OneDrive' })
+                }
+            }
+            catch {
+                Write-Step "Skipping unavailable optional user registry branch '$userOverlayRoot'."
+                $userOverlayChildren = @()
+            }
+            foreach ($overlay in $userOverlayChildren) {
+                try {
                     Remove-RegistryKeyIfExists -RegistryPath "$hiveName\Software\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\$($overlay.PSChildName)" -Description 'OneDrive user shell overlay registration'
+                }
+                catch {
+                    Write-WarningMsg "Could not clean optional user OneDrive overlay '$($overlay.PSChildName)': $($_.Exception.Message)"
                 }
             }
         }
