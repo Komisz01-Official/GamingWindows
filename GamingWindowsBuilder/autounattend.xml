@@ -194,13 +194,6 @@
 			<CommandLine>cmd /c net user User "" /add /fullname:"Gamer"</CommandLine>
 			<RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
-
-        <SynchronousCommand wcm:action="add">
-			<Order>2</Order>
-			<Description>Remove OneDrive residual payloads</Description>
-			<CommandLine>cmd /c del /f /q "%SystemRoot%\System32\OneDriveSetup.exe" &amp; del /f /q "%SystemRoot%\SysWOW64\OneDriveSetup.exe" &amp; rd /s /q "%ProgramFiles%\Microsoft OneDrive" &amp; rd /s /q "%ProgramFiles(x86)%\Microsoft OneDrive" &amp; exit /b 0</CommandLine>
-			<RequiresUserInput>false</RequiresUserInput>
-        </SynchronousCommand>
 		
 		</FirstLogonCommands>
 
