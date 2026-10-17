@@ -191,7 +191,7 @@
         <SynchronousCommand wcm:action="add">
 			<Order>1</Order>
 			<Description>Create passwordless Gamer user account</Description>
-			<CommandLine>cmd /c net user User "" /add /fullname:"Gamer" &amp; net localgroup Users User /add</CommandLine>
+			<CommandLine>cmd /c net user User "" /add /fullname:"Gamer"</CommandLine>
 			<RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
