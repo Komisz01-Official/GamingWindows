@@ -2085,21 +2085,123 @@ $index = $null
     $mainProgress.StartStep("Removing OneDrive")
     Write-Step "Removing OneDrive and its registry/shell integration..."
 
+    # ------------------------------------------------------------------
+    # Remove the OneDrive component package FIRST so that Windows Resource
+    # Protection (WRP) stops blocking deletion of OneDriveSetup.exe.
+    # WRP enforces protection based on the component store manifest; once
+    # the owning package is removed from the image, the file becomes an
+    # ordinary (ACL-only) file and Invoke-TakeOwnership + Remove-PathSafe
+    # can delete it offline.
+    # ------------------------------------------------------------------
+    Write-Step "Removing OneDrive component package from the servicing stack..."
+
+    $oneDrivePackagePrefixes = @(
+        'Microsoft-Windows-OneDrive-Setup',
+        'Microsoft-Windows-OneDrive-SyncEngine',
+        'Microsoft-Windows-OneDrive'
+    )
+
+    $oneDrivePkgResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+        '/English', "/image:$MOUNT_DIR", '/Get-Packages'
+    )
+    if ($oneDrivePkgResult.ExitCode -ne 0) {
+        throw "Failed to enumerate image packages for OneDrive removal (DISM exit code $($oneDrivePkgResult.ExitCode)): $($oneDrivePkgResult.Output -join ' ')"
+    }
+
+    $oneDrivePackages = @(
+        $oneDrivePkgResult.Output |
+            ForEach-Object {
+                if ($_ -match 'Package Identity\s*:\s*(.*)') { $matches[1].Trim() }
+            } |
+            Where-Object {
+                $pkg = $_
+                foreach ($prefix in $oneDrivePackagePrefixes) {
+                    if ($pkg -like "$prefix*") { return $true }
+                }
+                return $false
+            } |
+            Select-Object -Unique
+    )
+
+    if ($oneDrivePackages.Count -gt 0) {
+        foreach ($pkg in $oneDrivePackages) {
+            Write-Step "Removing package: $pkg"
+            $removePkgResult = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+                '/English', "/image:$MOUNT_DIR",
+                '/Remove-Package', "/PackageName:$pkg",
+                '/NoRestart'
+            )
+            if ($removePkgResult.ExitCode -ne 0) {
+                Write-WarningMsg "Could not remove OneDrive package '$pkg' (DISM exit code $($removePkgResult.ExitCode)). The file-deletion fallback will still be attempted."
+            } else {
+                Write-Ok "Removed OneDrive component package: $pkg"
+            }
+        }
+    } else {
+        Write-Step "No OneDrive servicing packages present in this image (may be integrated differently); continuing with file removal."
+    }
+
+    # Verify the package actually disappeared so we know WRP is unblocked.
+    $oneDrivePkgVerify = Invoke-NativeCommand -FilePath 'dism.exe' -Arguments @(
+        '/English', "/image:$MOUNT_DIR", '/Get-Packages'
+    )
+    if ($oneDrivePkgVerify.ExitCode -eq 0) {
+        $remainingOneDrivePkgs = @(
+            $oneDrivePkgVerify.Output |
+                ForEach-Object {
+                    if ($_ -match 'Package Identity\s*:\s*(.*)') { $matches[1].Trim() }
+                } |
+                Where-Object {
+                    $pkg = $_
+                    foreach ($prefix in $oneDrivePackagePrefixes) {
+                        if ($pkg -like "$prefix*") { return $true }
+                    }
+                    return $false
+                }
+        )
+        if ($remainingOneDrivePkgs.Count -gt 0) {
+            Write-WarningMsg "OneDrive package(s) still registered after removal: $($remainingOneDrivePkgs -join ', '). File deletion may still be blocked by WRP."
+        } else {
+            Write-Ok "OneDrive component package(s) fully removed; WRP should no longer block file deletion."
+        }
+    }
+
     $oneDrivePaths = @(
         "$MOUNT_DIR\Windows\System32\OneDriveSetup.exe",
         "$MOUNT_DIR\SysWOW64\OneDriveSetup.exe",
         "$MOUNT_DIR\Program Files\Microsoft OneDrive",
         "$MOUNT_DIR\Program Files (x86)\Microsoft OneDrive"
     )
+        $oneDriveFailedPaths = [System.Collections.Generic.List[string]]::new()
     foreach ($oneDrivePath in $oneDrivePaths) {
-        if (Test-Path -LiteralPath $oneDrivePath) {
-            if (-not (Invoke-TakeOwnership -Path $oneDrivePath -Recurse)) {
-                throw "Failed to take ownership of OneDrive payload '$oneDrivePath'."
-            }
-            if (-not (Remove-PathSafe -Path $oneDrivePath)) {
-                throw "Failed to remove OneDrive payload '$oneDrivePath'."
+        if (-not (Test-Path -LiteralPath $oneDrivePath)) { continue }
+
+        # Extra hardening for the servicing-stack-protected binaries:
+        # clear ReadOnly, re-take ownership, retry deletion a few times.
+        try { Set-ItemProperty -LiteralPath $oneDrivePath -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue } catch { }
+
+        if (-not (Invoke-TakeOwnership -Path $oneDrivePath -Recurse)) {
+            Write-WarningMsg "Take-ownership failed for OneDrive payload '$oneDrivePath'; attempting deletion anyway."
+        }
+
+        $deleted = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $deleted; $attempt++) {
+            if (Remove-PathSafe -Path $oneDrivePath -Silent) {
+                $deleted = $true
+            } else {
+                [GC]::Collect()
+                [GC]::WaitForPendingFinalizers()
+                Start-Sleep -Seconds 2
             }
         }
+
+        if (-not $deleted) {
+            [void]$oneDriveFailedPaths.Add($oneDrivePath)
+            Write-WarningMsg "Could not delete OneDrive payload '$oneDrivePath' after package removal + 3 attempts."
+        }
+    }
+    if ($oneDriveFailedPaths.Count -gt 0) {
+        Write-WarningMsg "OneDrive payloads still present (non-fatal after package removal): $($oneDriveFailedPaths -join ', ')"
     }
 
     foreach ($pattern in @(
@@ -2244,10 +2346,11 @@ $index = $null
         "$MOUNT_DIR\Program Files (x86)\Microsoft OneDrive"
     ) | Where-Object { Test-Path -LiteralPath $_ }
 
-    if ($remainingOneDrive.Count -gt 0) {
-        Write-WarningMsg "These OneDrive payloads could not be removed offline (protected by the servicing stack); they will be removed on first boot: $($remainingOneDrive -join ', ')"
+        if ($remainingOneDrive.Count -gt 0) {
+        Write-WarningMsg "OneDrive payloads still present after package removal: $($remainingOneDrive -join ', '). Their registry entries and startup integration are already gone, so they are inert; no first-boot deletion is required."
+    } else {
+        Write-Ok "All OneDrive payload files removed from the offline image."
     }
-    Write-Ok "OneDrive client, shell integration, startup entries, and uninstall registrations removed (user OneDrive folders preserved)."
     $mainProgress.CompleteStep()
 
     # ==================== REGISTRY TWEAKS ====================
