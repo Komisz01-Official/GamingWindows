@@ -3,48 +3,49 @@
           xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
 
   <!--
-    GamingWindowsBuilder companion unattend.xml
+    GamingWindowsBuilder companion answer file.
 
-    Design goals:
+    Configuration:
       - Windows 11 Pro
-      - Hungarian UI (primary), English UI (secondary/fallback)
-      - German keyboard (primary), Hungarian keyboard (secondary)
-      - Optional TPM / Secure Boot / RAM setup bypasses retained from the source XML
-      - Two local accounts:
-          Admin = local administrator, NOT used for daily work, password is temporarily set to 0x8030000C
-          User  = standard user, intended for daily work ("Gamer" is the display name)
-      - Single-use auto-logon as the daily-driver account so FirstLogonCommands
-        can run before any interactive logon. AutoLogon is disabled after the
-        first logon by LogonCount=1.
-      - NO embedded third-party debloat/customization scripts
-      - NO automatic disk partitioning/wiping
-      - NO Windows Update disabling/pausing
-      - NO UAC/VBS/security-feature changes
+      - English (United States) display language and regional preferences
+      - US keyboard layout
+      - Optional TPM / Secure Boot / RAM setup bypasses retained
+      - Local administrator account: Admin
+      - Standard daily-use account: User, with display name "Gamer",
+        created by FirstLogonCommands
+      - One automatic logon as Admin
+      - No automatic disk partitioning or wiping
+      - No Windows Update disabling/pausing
+      - No UAC/VBS/security-feature changes in this answer file
+
+    Note: Language settings select English (United States); they do not add
+    English language resources if the selected Windows image lacks them.
   -->
 
   <settings pass="windowsPE">
     <component name="Microsoft-Windows-International-Core-WinPE"
-              processorArchitecture="amd64"
-              publicKeyToken="31bf3856ad364e35"
-              language="neutral"
-              versionScope="nonSxS">
-      <!-- Installer UI stays in English; the installed OS will use Hungarian
-           because the oobeSystem pass below overrides it. -->
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
       <UILanguage>en-US</UILanguage>
       <SetupUILanguage>
         <UILanguage>en-US</UILanguage>
       </SetupUILanguage>
+      <InputLocale>0409:00000409</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UserLocale>en-US</UserLocale>
     </component>
 
     <component name="Microsoft-Windows-Setup"
-              processorArchitecture="amd64"
-              publicKeyToken="31bf3856ad364e35"
-              language="neutral"
-              versionScope="nonSxS">
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
 
       <UserData>
         <ProductKey>
-          <!-- Generic Windows 11 Pro installation key; this does NOT activate Windows. -->
+          <!-- Generic Windows 11 Pro installation key; this does not activate Windows. -->
           <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
           <WillShowUI>OnError</WillShowUI>
         </ProductKey>
@@ -53,9 +54,7 @@
 
       <UseConfigurationSet>false</UseConfigurationSet>
 
-      <!-- Keep the hardware-requirement bypasses from the supplied XML.
-           Remove this RunSynchronous block if the target PC already satisfies
-           Windows 11 requirements and you want normal Setup enforcement. -->
+      <!-- Optional Windows 11 hardware-requirement bypasses. -->
       <RunSynchronous>
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
@@ -73,69 +72,28 @@
     </component>
   </settings>
 
-  <!-- Intentionally no specialize scripts, registry hacks, package removal,
-       scheduled tasks, Edge modifications, or OneDrive removal here.
-       Those responsibilities belong to GamingWindowsBuilder. -->
+  <!-- No specialize scripts are defined in this answer file. -->
 
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-International-Core"
-              processorArchitecture="amd64"
-              publicKeyToken="31bf3856ad364e35"
-              language="neutral"
-              versionScope="nonSxS">
-
-      <!--
-        Display language: Hungarian primary, English secondary.
-        UILanguageFallback is what Windows falls back to for any resource
-        that has no Hungarian string; without it, some OOBE and shell text
-        can appear in an unexpected language.
-      -->
-      <UILanguage>hu-HU</UILanguage>
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <UILanguage>en-US</UILanguage>
       <UILanguageFallback>en-US</UILanguageFallback>
-
-      <!--
-        Regional formats: Hungarian.
-        SystemLocale governs non-Unicode (codepage) programs.
-        UserLocale governs date/time/number/currency format for new accounts.
-      -->
-      <SystemLocale>hu-HU</SystemLocale>
-      <UserLocale>hu-HU</UserLocale>
-
-      <!--
-        Input locales: German primary, Hungarian secondary.
-        Format is <languageID>:<keyboardLayoutID>, semicolon-separated.
-        The FIRST pair becomes the default keyboard for the account.
-
-          0407 = German (Germany)
-          040e = Hungarian (Hungary)
-
-          00000407 = German QWERTZ
-          0000040e = Hungarian
-
-        Both layouts are installed. The user can switch between them with
-        Win+Space or by clicking the language indicator in the taskbar.
-      -->
-      <InputLocale>0407:00000407;040e:0000040e</InputLocale>
-
+      <SystemLocale>en-US</SystemLocale>
+      <UserLocale>en-US</UserLocale>
+      <InputLocale>0409:00000409</InputLocale>
     </component>
 
     <component name="Microsoft-Windows-Shell-Setup"
-              processorArchitecture="amd64"
-              publicKeyToken="31bf3856ad364e35"
-              language="neutral"
-              versionScope="nonSxS">
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
 
-            <!--
-        Two-account model:
-
-          Admin = local administrator, used for setup/maintenance.
-          User  = standard daily-driver account, created on first boot.
-                  DisplayName = "Gamer"
-                  No password.
-
-        Admin is the only account created during Setup so that the first
-        automatic logon cannot depend on an account that does not yet exist.
-      -->
+      <!-- Create Admin during Setup; create the standard User account at first logon. -->
       <UserAccounts>
         <LocalAccounts>
           <LocalAccount wcm:action="add">
@@ -151,13 +109,7 @@
         </LocalAccounts>
       </UserAccounts>
 
-      <!--
-        Single-use auto-logon as Admin.
-
-        Admin performs the first-boot setup, including creation of the
-        passwordless standard User account. AutoLogon is disabled after
-        this one login by LogonCount=1.
-      -->
+      <!-- One automatic logon as Admin so FirstLogonCommands can run. -->
       <AutoLogon>
         <Password>
           <Value>0x8030000C</Value>
@@ -173,29 +125,18 @@
         <HideEULAPage>true</HideEULAPage>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
-		<HidePrivacySettings>true</HidePrivacySettings>
+        <HidePrivacySettings>true</HidePrivacySettings>
       </OOBE>
 
-      <!--
-        FirstLogonCommands run during the first automatic Admin session.
-
-        Order 1:
-          Create the standard User account with no password and set its
-          display name to "Gamer".
-
-        Order 2:
-          Remove OneDrive residual payloads.
-      -->
+      <!-- Create the passwordless standard User account with display name "Gamer". -->
       <FirstLogonCommands>
-
         <SynchronousCommand wcm:action="add">
-			<Order>1</Order>
-			<Description>Create passwordless Gamer user account</Description>
-			<CommandLine>cmd /c net user User "" /add /fullname:"Gamer"</CommandLine>
-			<RequiresUserInput>false</RequiresUserInput>
+          <Order>1</Order>
+          <Description>Create passwordless Gamer user account</Description>
+          <CommandLine>cmd /c net user User "" /add /fullname:"Gamer"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
-		
-		</FirstLogonCommands>
+      </FirstLogonCommands>
 
     </component>
   </settings>
