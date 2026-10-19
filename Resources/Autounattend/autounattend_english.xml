@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <!--
+    GamingWindowsBuilder companion answer file.
+
+    Configuration:
+      - Windows 11 Pro
+      - English (United States) display language and regional preferences
+      - US keyboard layout
+      - Optional TPM / Secure Boot / RAM setup bypasses retained
+      - Local administrator account: Admin
+      - Standard daily-use account: User, with display name "Gamer",
+        created by FirstLogonCommands
+      - One automatic logon as Admin
+      - No automatic disk partitioning or wiping
+      - No Windows Update disabling/pausing
+      - No UAC/VBS/security-feature changes in this answer file
+
+    Note: Language settings select English (United States); they do not add
+    English language resources if the selected Windows image lacks them.
+  -->
+
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <UILanguage>en-US</UILanguage>
+      <SetupUILanguage>
+        <UILanguage>en-US</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>0409:00000409</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+
+      <UserData>
+        <ProductKey>
+          <!-- Generic Windows 11 Pro installation key; this does not activate Windows. -->
+          <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+
+      <UseConfigurationSet>false</UseConfigurationSet>
+
+      <!-- Optional Windows 11 hardware-requirement bypasses. -->
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg.exe add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg.exe add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg.exe add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <!-- No specialize scripts are defined in this answer file. -->
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <UILanguage>en-US</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+      <SystemLocale>en-US</SystemLocale>
+      <UserLocale>en-US</UserLocale>
+      <InputLocale>0409:00000409</InputLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+
+      <!-- Create Admin during Setup; create the standard User account at first logon. -->
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>Admin</Name>
+            <DisplayName>Administrator</DisplayName>
+            <Description>Local administrator account for maintenance and initial setup.</Description>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>0x8030000C</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <!-- One automatic logon as Admin so FirstLogonCommands can run. -->
+      <AutoLogon>
+        <Password>
+          <Value>0x8030000C</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+        <Username>Admin</Username>
+      </AutoLogon>
+
+      <OOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <HideEULAPage>true</HideEULAPage>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HidePrivacySettings>true</HidePrivacySettings>
+      </OOBE>
+
+      <!-- Create the passwordless standard User account with display name "Gamer". -->
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Create passwordless Gamer user account</Description>
+          <CommandLine>cmd /c net user User "" /add /fullname:"Gamer"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+
+    </component>
+  </settings>
+</unattend>
