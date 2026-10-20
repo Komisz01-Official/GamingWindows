@@ -102,7 +102,7 @@
             <Description>Local administrator account for maintenance and initial setup.</Description>
             <Group>Administrators</Group>
             <Password>
-              <Value>0x8030000C</Value>
+              <Value>AreYouSureAboutThis</Value>
               <PlainText>true</PlainText>
             </Password>
           </LocalAccount>
@@ -112,7 +112,7 @@
       <!-- One automatic logon as Admin so FirstLogonCommands can run. -->
       <AutoLogon>
         <Password>
-          <Value>0x8030000C</Value>
+          <Value>AreYouSureAboutThis</Value>
           <PlainText>true</PlainText>
         </Password>
         <Enabled>true</Enabled>
