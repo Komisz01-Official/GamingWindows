@@ -2980,7 +2980,7 @@ $index = $null
         '-u2'
         '-udfver102'
         "-yo$bootOrderPath"
-        "-bootdata:2#p0,e,b$etfsBootPath#p0,e,b$efisysBinPath"
+        "-bootdata:2#p0,e,b$etfsBootPath#pEF,e,b$efisysBinPath"
         $WORK_DIR
         $isoPath
     )
