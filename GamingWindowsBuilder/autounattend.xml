@@ -127,16 +127,30 @@
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
       </OOBE>
 
-      <!-- Create the passwordless standard User account with display name "Gamer". -->
-      <FirstLogonCommands>
-        <SynchronousCommand wcm:action="add">
-          <Order>1</Order>
-          <Description>Create passwordless Gamer user account</Description>
-          <CommandLine>cmd /c net user User "" /add /fullname:"Gamer"</CommandLine>
-          <RequiresUserInput>false</RequiresUserInput>
-        </SynchronousCommand>
-      </FirstLogonCommands>
+      <!--
+        FirstLogonCommands run during the first automatic Admin session.
 
+        Order 1:
+          Create the standard User account with no password and set its
+          display name to "Gamer".
+
+        Order 2:
+          Remove OneDrive residual payloads.
+      -->
+      <FirstLogonCommands>
+                <SynchronousCommand wcm:action="add">
+                          <Order>1</Order>
+                          <Description>Create passwordless Gamer user account</Description>
+                          <CommandLine>cmd /c net user User "" /add /fullname:"Gamer" &amp; net localgroup Users User /add</CommandLine>
+                          <RequiresUserInput>false</RequiresUserInput>
+                </SynchronousCommand>
+                <SynchronousCommand wcm:action="add">
+                          <Order>2</Order>
+                          <Description>Remove OneDrive residual payloads</Description>
+                          <CommandLine>cmd /c del /f /q "%SystemRoot%\System32\OneDriveSetup.exe" &amp; del /f /q "%SystemRoot%\SysWOW64\OneDriveSetup.exe" &amp; rd /s /q "%ProgramFiles%\Microsoft OneDrive" &amp; rd /s /q "%ProgramFiles(x86)%\Microsoft OneDrive" &amp; exit /b 0</CommandLine>
+                          <RequiresUserInput>false</RequiresUserInput>
+                </SynchronousCommand>
+      </FirstLogonCommands>
     </component>
   </settings>
 </unattend>
